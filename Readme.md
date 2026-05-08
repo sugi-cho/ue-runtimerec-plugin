@@ -4,7 +4,7 @@ Unreal Engine の Runtime 実行中に、Viewport または `UTextureRenderTarge
 
 ## 対応環境
 
-- Unreal Engine 5.7 でビルド確認済み
+- Unreal Engine 5.7 以降
 - Windows / Win64
 - Development / Shipping ビルド対応
 - 映像エンコードは Windows Media Foundation の H.264 / MP4 を使用
@@ -174,15 +174,3 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 - 音声録音は未対応です。
 - 複数同時録画は未対応です。
 - Windows以外のMP4エンコードは未対応です。
-
-## 動作確認済みビルド
-
-以下のビルドが成功することを確認済みです。
-
-```powershell
-& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPluginEditor Win64 Development -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
-& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Development -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
-& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Shipping -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
-```
-
-Editor起動中に Live Coding が有効な場合、通常ビルドが止まることがあります。その場合は Editor 側で Live Coding を停止するか、上記のように `-NoHotReloadFromIDE` を指定してください。

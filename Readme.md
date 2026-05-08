@@ -196,7 +196,8 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 
 ## 実装上の注意
 
-- フレーム取得はゲームスレッド上で `ReadPixels` を使います。
+- RenderTarget 録画は `FRHIGPUTextureReadback` による非同期 readback を優先します。未対応形式などの場合は既存の `ReadPixels` 経路にフォールバックします。
+- Viewport 録画は現在も `ReadPixels` を使います。
 - エンコードは別スレッドで行います。
 - フレームキューが詰まった場合、既定では古いフレームを破棄して遅延増加を抑えます。
 - 音声録音は未対応です。

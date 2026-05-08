@@ -1,11 +1,13 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeBool.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "RuntimeRecTypes.h"
 #include "RuntimeRecSubsystem.generated.h"
 
+class FRHIGPUTextureReadback;
 class FRuntimeRecVideoEncoder;
 class UTextureRenderTarget2D;
 
@@ -86,6 +88,21 @@ private:
 	static FString MakeUniqueOutputPath(const FString& OutputDirectory, const FString& FileName);
 	static FString SanitizeBaseFileName(const FString& FileName);
 
+	struct FRuntimeRecReadbackRequest
+	{
+		TSharedPtr<FRHIGPUTextureReadback, ESPMode::ThreadSafe> Readback;
+		TArray<FColor> Pixels;
+		FString Error;
+		int32 Width = 0;
+		int32 Height = 0;
+		int64 CaptureFrameIndex = 0;
+		FThreadSafeBool bCheckQueued = false;
+		FThreadSafeBool bReadyForEncode = false;
+		FThreadSafeBool bHadError = false;
+		FThreadSafeBool bSkipped = false;
+		FThreadSafeBool bCancelled = false;
+	};
+
 	struct FRuntimeRecRecordingSession
 	{
 		TWeakObjectPtr<UTextureRenderTarget2D> SourceRenderTarget;
@@ -94,7 +111,9 @@ private:
 		FString LastError;
 		double AccumulatedTime = 0.0;
 		double FrameInterval = 1.0 / 30.0;
+		int64 NextCaptureFrameIndex = 0;
 		FRuntimeRecVideoEncoder* Encoder = nullptr;
+		TArray<TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe>> PendingReadbacks;
 	};
 
 	bool StartRenderTargetRecordingInternal(
@@ -109,6 +128,15 @@ private:
 		FString& OutSavedFilePath,
 		FString& OutError);
 	void TickRenderTargetSessions(float DeltaTime);
+	void PollRenderTargetReadbacks(
+		const FString& SessionId,
+		FRuntimeRecRecordingSession& Session,
+		TArray<FString>& SessionsToRemove);
+	bool QueueRenderTargetReadback(
+		FRuntimeRecRecordingSession& Session,
+		FString& OutError,
+		bool& bOutCanUseReadPixelsFallback);
+	bool CaptureRenderTargetFrameFallback(FRuntimeRecRecordingSession& Session, FString& OutError);
 	bool HasAnyRenderTargetSessions() const;
 	void ClearRenderTargetSession(FRuntimeRecRecordingSession& Session);
 

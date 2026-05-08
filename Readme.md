@@ -34,7 +34,6 @@ StartViewportRecording(
     FileName,
     FPS,
     BitrateKbps,
-    bIncludeUI,
     OutSessionId,
     OutError)
 ```
@@ -45,7 +44,6 @@ StartViewportRecording(
 - `FileName`: 出力ファイル名。拡張子は不要です。空文字の場合は自動命名します。
 - `FPS`: 録画FPS。
 - `BitrateKbps`: 映像ビットレート。
-- `bIncludeUI`: APIとして保持しています。現実装のViewport取得は画面出力を読むため、基本的に表示結果に準じます。
 - `OutSessionId`: 停止時に使うセッションID。
 - `OutError`: 失敗理由。
 
@@ -54,6 +52,7 @@ StartViewportRecording(
 注意:
 
 - H.264 の都合上、Viewport の幅と高さは偶数である必要があります。
+- Viewport 録画では Slate UI や UMG オーバーレイは録画されません。
 
 ### RenderTarget 録画開始
 
@@ -83,6 +82,29 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 注意:
 
 - H.264 の都合上、RenderTarget の幅と高さは偶数である必要があります。
+
+### Camera から RenderTarget を自動生成するアクター
+
+`RuntimeRecCameraCaptureActor` をレベルに配置すると、指定した `CameraActor` の映像を `TextureRenderTarget2D` に書き込みできます。
+
+使い方:
+
+1. `RuntimeRecCameraCaptureActor` をレベルに配置します。
+2. `SourceCamera` に録画したい `CameraActor` または `CineCameraActor` を設定します。
+3. `TargetRenderTarget` を設定するか、空のままにして自動生成を使います。
+4. 必要なら `RenderTargetWidth` / `RenderTargetHeight` を設定します。
+5. `bIncludeCameraPostProcess` でカメラの PostProcess を反映するか切り替えます。
+6. 生成された `RenderTarget` を `StartRenderTargetRecording` に渡して録画します。
+7. PIE を開始しなくても、レベルビューポート表示中に自動更新します。
+
+補足:
+
+- `TargetRenderTarget` が未設定の場合、`RenderTargetWidth` / `RenderTargetHeight` から自動生成します。
+- 自動生成された `RenderTarget` はランタイム用の transient オブジェクトです。
+- 自動生成された `RenderTarget` は LDR / sRGB 前提で作成します。暗く見える場合は、既存の `RenderTarget` の `sRGB` 設定も確認してください。
+- `bIncludeCameraPostProcess=true` の場合は、カメラの PostProcessSettings を反映します。
+- `bIncludeCameraPostProcess=false` の場合は、PostProcess を無効化した映像になります。
+- UI はこの経路でも録画されません。
 
 ### 録画停止
 
@@ -130,13 +152,19 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 
 - `FPS`: 30
 - `BitrateKbps`: 12000
-- `bIncludeUI`: true
 
 ### RenderTarget
 
 - RenderTarget解像度: 1920 x 1080
 - `FPS`: 30
 - `BitrateKbps`: 12000
+- 既存の RenderTarget を使う場合は `sRGB` 設定を確認してください
+
+### Camera Capture Actor
+
+- `RenderTargetWidth`: 1920
+- `RenderTargetHeight`: 1080
+- `bIncludeCameraPostProcess`: true
 
 ## 実装上の注意
 

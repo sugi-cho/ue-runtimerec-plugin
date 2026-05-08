@@ -260,7 +260,7 @@ bool URuntimeRecSubsystem::CaptureRenderTargetFrame(TArray<FColor>& OutPixels, i
 	OutWidth = RenderTarget->SizeX;
 	OutHeight = RenderTarget->SizeY;
 	FReadSurfaceDataFlags Flags(RCM_UNorm);
-	Flags.SetLinearToGamma(false);
+	Flags.SetLinearToGamma(!RenderTarget->IsSRGB());
 
 	const bool bRead = Resource->ReadPixels(OutPixels, Flags);
 	if (!bRead || OutPixels.Num() != OutWidth * OutHeight)

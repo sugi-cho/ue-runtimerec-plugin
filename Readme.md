@@ -42,8 +42,8 @@ StartViewportRecording(
 
 - `OutputDirectory`: 出力先ディレクトリ。空文字の場合は既定保存先を使用します。
 - `FileName`: 出力ファイル名。拡張子は不要です。空文字の場合は自動命名します。
-- `FPS`: 録画FPS。
-- `BitrateKbps`: 映像ビットレート。
+- `FPS`: 録画FPS。既定値は `30` です。
+- `BitrateKbps`: 映像ビットレート。既定値は `12000` です。
 - `OutSessionId`: 停止時に使うセッションID。
 - `OutError`: 失敗理由。
 
@@ -72,8 +72,8 @@ StartRenderTargetRecording(
 - `RenderTarget`: 録画対象の `TextureRenderTarget2D`。
 - `OutputDirectory`: 出力先ディレクトリ。空文字の場合は既定保存先を使用します。
 - `FileName`: 出力ファイル名。拡張子は不要です。空文字の場合は自動命名します。
-- `FPS`: 録画FPS。
-- `BitrateKbps`: 映像ビットレート。
+- `FPS`: 録画FPS。既定値は `30` です。
+- `BitrateKbps`: 映像ビットレート。既定値は `12000` です。
 - `OutSessionId`: 停止時に使うセッションID。
 - `OutError`: 失敗理由。
 
@@ -83,9 +83,9 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 
 - H.264 の都合上、RenderTarget の幅と高さは偶数である必要があります。
 
-### Camera から RenderTarget を自動生成して録画するアクター
+### Camera から RenderTarget を書き込むアクター
 
-`RuntimeRecCameraCaptureActor` をレベルに配置すると、指定した `CameraActor` の映像を `TextureRenderTarget2D` に書き込み、そのまま MP4 録画まで行えます。
+`RuntimeRecCameraCaptureActor` をレベルに配置すると、指定した `CameraActor` の映像を `TextureRenderTarget2D` に書き込みます。通常の運用では録画そのものは行わず、`RuntimeRec Recording Group` からその RenderTarget をまとめて録画します。
 
 使い方:
 
@@ -94,10 +94,8 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 3. `TargetRenderTarget` を設定するか、空のままにして自動生成を使います。
 4. 必要なら `RenderTargetWidth` / `RenderTargetHeight` を設定します。
 5. `bIncludeCameraPostProcess` でカメラの PostProcess を反映するか切り替えます。
-6. `OutputDirectory` / `FileName` / `FPS` / `BitrateKbps` を設定します。
-7. `bAutoStartRecording` を有効にすると、`BeginPlay` で自動録画を開始します。
-8. 手動開始したい場合は `StartRecording` を呼びます。
-9. PIE を開始しなくても、レベルビューポート表示中に自動更新します。
+6. 必要に応じて `OutputDirectory` / `FileName` を設定します。
+7. PIE を開始しなくても、レベルビューポート表示中に自動更新します。
 
 補足:
 
@@ -107,7 +105,27 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 - `bIncludeCameraPostProcess=true` の場合は、カメラの PostProcessSettings を反映します。
 - `bIncludeCameraPostProcess=false` の場合は、PostProcess を無効化した映像になります。
 - UI はこの経路でも録画されません。
-- 録画停止は `StopRecording` で行います。
+
+### 同時録画用 Actor
+
+`RuntimeRec Recording Group` をレベルに配置すると、複数の `RenderTarget` と `RuntimeRecCameraCaptureActor` をまとめて同時録画できます。
+
+使い方:
+
+1. `RuntimeRec Recording Group` をレベルに配置します。
+2. `TargetRenderTargets` に直接録画したい `RenderTarget` を設定します。
+3. `TargetCameraCaptureActors` に `RuntimeRecCameraCaptureActor` を設定します。
+4. `OutputDirectory` と `FileNamePrefix` を設定します。
+5. `FPS` と `BitrateKbps` を設定します。
+6. `StartRecording` を呼ぶと、設定済みの対象をすべて同時開始します。
+7. `StopRecording` を呼ぶと、設定済みの対象をすべて同時停止します。
+
+補足:
+
+- `FPS` の既定値は `30`、`BitrateKbps` の既定値は `12000` です。
+- 同時録画はこの Actor からのみ実行する前提です。
+- 1つの Group 内では、同じ `FPS` と `BitrateKbps` を全対象に上書きします。
+- `RuntimeRecCameraCaptureActor` は録画前段の RenderTarget 生成・更新担当です。
 
 ### 録画停止
 
@@ -169,11 +187,19 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 - `RenderTargetHeight`: 1080
 - `bIncludeCameraPostProcess`: true
 
+### Recording Group Actor
+
+- `FPS`: 30
+- `BitrateKbps`: 12000
+- `TargetRenderTargets`: 必要な分だけ設定
+- `TargetCameraCaptureActors`: 必要な分だけ設定
+
 ## 実装上の注意
 
 - フレーム取得はゲームスレッド上で `ReadPixels` を使います。
 - エンコードは別スレッドで行います。
 - フレームキューが詰まった場合、既定では古いフレームを破棄して遅延増加を抑えます。
 - 音声録音は未対応です。
-- 複数同時録画は未対応です。
+- Viewport 録画と同時に複数録画を行うことはできません。
+- 複数同時録画は RenderTarget 系のみ対応です。
 - Windows以外のMP4エンコードは未対応です。

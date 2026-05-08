@@ -91,7 +91,7 @@ public:
 	bool bPreferHardwareEncoder = true;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
-	bool bAutoStartRecording = true;
+	bool bAutoStartRecording = false;
 
 private:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "UE_RuntimeRec", meta = (AllowPrivateAccess = "true"))

@@ -12,7 +12,7 @@ class RUNTIMEREC_API URuntimeRecBlueprintLibrary : public UBlueprintFunctionLibr
 	GENERATED_BODY()
 
 public:
-	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec", meta = (WorldContext = "WorldContextObject"))
+	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec", meta = (WorldContext = "WorldContextObject", CPP_Default_FPS = "30", CPP_Default_BitrateKbps = "12000"))
 	static bool StartViewportRecording(
 		const UObject* WorldContextObject,
 		const FString& OutputDirectory,
@@ -22,7 +22,7 @@ public:
 		FString& OutSessionId,
 		FString& OutError);
 
-	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec", meta = (WorldContext = "WorldContextObject"))
+	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec", meta = (WorldContext = "WorldContextObject", CPP_Default_FPS = "30", CPP_Default_BitrateKbps = "12000"))
 	static bool StartRenderTargetRecording(
 		const UObject* WorldContextObject,
 		UTextureRenderTarget2D* RenderTarget,

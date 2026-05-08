@@ -18,43 +18,44 @@ void URuntimeRecSubsystem::Deinitialize()
 		StopRecording(CurrentSessionId, IgnoredPath, IgnoredError);
 	}
 
+	TArray<FString> SessionIds;
+	ActiveRenderTargetSessions.GetKeys(SessionIds);
+	for (const FString& SessionId : SessionIds)
+	{
+		FString IgnoredPath;
+		FString IgnoredError;
+		StopRenderTargetRecordingInternal(SessionId, IgnoredPath, IgnoredError);
+	}
+
 	Super::Deinitialize();
 }
 
 void URuntimeRecSubsystem::Tick(float DeltaTime)
 {
-	if (!bRecording || !Encoder)
+	if (bRecording && Encoder)
 	{
-		return;
+		AccumulatedTime += DeltaTime;
+		if (AccumulatedTime >= FrameInterval)
+		{
+			AccumulatedTime = FMath::Fmod(AccumulatedTime, FrameInterval);
+
+			TArray<FColor> Pixels;
+			int32 CapturedWidth = 0;
+			int32 CapturedHeight = 0;
+			if (CaptureViewportFrame(Pixels, CapturedWidth, CapturedHeight))
+			{
+				CropFrameToSize(Pixels, CapturedWidth, CapturedHeight, ActiveOptions.Width, ActiveOptions.Height);
+
+				FString EncodeError;
+				if (!Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
+				{
+					SetError(EncodeError);
+				}
+			}
+		}
 	}
 
-	AccumulatedTime += DeltaTime;
-	if (AccumulatedTime < FrameInterval)
-	{
-		return;
-	}
-
-	AccumulatedTime = FMath::Fmod(AccumulatedTime, FrameInterval);
-
-	TArray<FColor> Pixels;
-	int32 CapturedWidth = 0;
-	int32 CapturedHeight = 0;
-	const bool bCaptured = Source == ERuntimeRecInputSource::RenderTarget
-		? CaptureRenderTargetFrame(Pixels, CapturedWidth, CapturedHeight)
-		: CaptureViewportFrame(Pixels, CapturedWidth, CapturedHeight);
-
-	if (!bCaptured)
-	{
-		return;
-	}
-
-	CropFrameToSize(Pixels, CapturedWidth, CapturedHeight, ActiveOptions.Width, ActiveOptions.Height);
-
-	FString EncodeError;
-	if (!Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
-	{
-		SetError(EncodeError);
-	}
+	TickRenderTargetSessions(DeltaTime);
 }
 
 TStatId URuntimeRecSubsystem::GetStatId() const
@@ -75,6 +76,12 @@ bool URuntimeRecSubsystem::StartViewportRecording(
 	FString& OutError)
 {
 	FRuntimeRecOptions ViewportOptions = Options;
+
+	if (bRecording || HasAnyRenderTargetSessions())
+	{
+		OutError = TEXT("Another recording is already active.");
+		return false;
+	}
 
 	if (!GEngine || !GEngine->GameViewport || !GEngine->GameViewport->Viewport)
 	{
@@ -98,7 +105,7 @@ bool URuntimeRecSubsystem::StartRenderTargetRecording(
 	FString& OutSessionId,
 	FString& OutError)
 {
-	return StartRecordingInternal(ERuntimeRecInputSource::RenderTarget, RenderTarget, OutputDirectory, FileName, Options, OutSessionId, OutError);
+	return StartRenderTargetRecordingInternal(RenderTarget, OutputDirectory, FileName, Options, OutSessionId, OutError);
 }
 
 bool URuntimeRecSubsystem::StopRecording(
@@ -106,35 +113,66 @@ bool URuntimeRecSubsystem::StopRecording(
 	FString& OutSavedFilePath,
 	FString& OutError)
 {
-	if (!bRecording)
+	if (bRecording && (SessionId.IsEmpty() || SessionId == CurrentSessionId))
 	{
-		OutError = TEXT("No active recording.");
-		return false;
-	}
-
-	if (!SessionId.IsEmpty() && SessionId != CurrentSessionId)
-	{
-		OutError = TEXT("SessionId does not match the active recording.");
-		return false;
-	}
-
-	if (Encoder)
-	{
-		if (!Encoder->Stop(OutError))
+		if (Encoder)
 		{
-			SetError(OutError);
+			if (!Encoder->Stop(OutError))
+			{
+				SetError(OutError);
+				return false;
+			}
+			delete Encoder;
+			Encoder = nullptr;
+		}
+
+		OutSavedFilePath = CurrentOutputPath;
+		bRecording = false;
+		CurrentSessionId.Reset();
+		AccumulatedTime = 0.0;
+		return true;
+	}
+
+	if (SessionId.IsEmpty())
+	{
+		if (ActiveRenderTargetSessions.Num() == 0)
+		{
+			OutError = TEXT("No active recording.");
 			return false;
 		}
-		delete Encoder;
-		Encoder = nullptr;
+
+		if (ActiveRenderTargetSessions.Num() > 1)
+		{
+			OutError = TEXT("Multiple render target recordings are active. SessionId is required.");
+			return false;
+		}
+
+		const FString OnlySessionId = ActiveRenderTargetSessions.CreateConstIterator().Key();
+		return StopRenderTargetRecordingInternal(OnlySessionId, OutSavedFilePath, OutError);
 	}
 
-	OutSavedFilePath = CurrentOutputPath;
-	bRecording = false;
-	SourceRenderTarget.Reset();
-	CurrentSessionId.Reset();
-	AccumulatedTime = 0.0;
-	return true;
+	return StopRenderTargetRecordingInternal(SessionId, OutSavedFilePath, OutError);
+}
+
+FString URuntimeRecSubsystem::GetRecordingOutputPath(const FString& SessionId) const
+{
+	if (bRecording && (SessionId.IsEmpty() || SessionId == CurrentSessionId))
+	{
+		return CurrentOutputPath;
+	}
+
+	if (SessionId.IsEmpty())
+	{
+		if (ActiveRenderTargetSessions.Num() == 1)
+		{
+			return ActiveRenderTargetSessions.CreateConstIterator().Value().CurrentOutputPath;
+		}
+
+		return FString();
+	}
+
+	const FRuntimeRecRecordingSession* Session = ActiveRenderTargetSessions.Find(SessionId);
+	return Session ? Session->CurrentOutputPath : FString();
 }
 
 bool URuntimeRecSubsystem::StartRecordingInternal(
@@ -146,26 +184,20 @@ bool URuntimeRecSubsystem::StartRecordingInternal(
 	FString& OutSessionId,
 	FString& OutError)
 {
-	if (bRecording)
+	if (InputSource != ERuntimeRecInputSource::Viewport)
 	{
-		OutError = TEXT("Recording is already active.");
+		OutError = TEXT("This recording path is reserved for viewport recording.");
+		return false;
+	}
+
+	if (bRecording || HasAnyRenderTargetSessions())
+	{
+		OutError = TEXT("Another recording is already active.");
 		return false;
 	}
 
 	Options.FPS = FMath::Clamp(Options.FPS, 1, 240);
 	Options.BitrateKbps = FMath::Max(Options.BitrateKbps, 1);
-
-	if (InputSource == ERuntimeRecInputSource::RenderTarget)
-	{
-		if (!RenderTarget)
-		{
-			OutError = TEXT("RenderTarget is null.");
-			return false;
-		}
-
-		Options.Width = RenderTarget->SizeX;
-		Options.Height = RenderTarget->SizeY;
-	}
 
 	ForceEvenFrameSize(Options.Width, Options.Height);
 
@@ -241,9 +273,8 @@ bool URuntimeRecSubsystem::CaptureViewportFrame(TArray<FColor>& OutPixels, int32
 	return true;
 }
 
-bool URuntimeRecSubsystem::CaptureRenderTargetFrame(TArray<FColor>& OutPixels, int32& OutWidth, int32& OutHeight)
+bool URuntimeRecSubsystem::CaptureRenderTargetFrame(UTextureRenderTarget2D* RenderTarget, TArray<FColor>& OutPixels, int32& OutWidth, int32& OutHeight)
 {
-	UTextureRenderTarget2D* RenderTarget = SourceRenderTarget.Get();
 	if (!RenderTarget)
 	{
 		SetError(TEXT("RenderTarget is no longer valid."));
@@ -270,6 +301,178 @@ bool URuntimeRecSubsystem::CaptureRenderTargetFrame(TArray<FColor>& OutPixels, i
 	}
 
 	return true;
+}
+
+bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
+	UTextureRenderTarget2D* RenderTarget,
+	const FString& OutputDirectory,
+	const FString& FileName,
+	const FRuntimeRecOptions& Options,
+	FString& OutSessionId,
+	FString& OutError)
+{
+	if (bRecording)
+	{
+		OutError = TEXT("Viewport recording is already active.");
+		return false;
+	}
+
+	if (!RenderTarget)
+	{
+		OutError = TEXT("RenderTarget is null.");
+		return false;
+	}
+
+	FRuntimeRecOptions LocalOptions = Options;
+	LocalOptions.FPS = FMath::Clamp(LocalOptions.FPS, 1, 240);
+	LocalOptions.BitrateKbps = FMath::Max(LocalOptions.BitrateKbps, 1);
+	LocalOptions.Width = RenderTarget->SizeX;
+	LocalOptions.Height = RenderTarget->SizeY;
+	ForceEvenFrameSize(LocalOptions.Width, LocalOptions.Height);
+
+	if (LocalOptions.Width <= 0 || LocalOptions.Height <= 0)
+	{
+		OutError = TEXT("Recording width and height must be greater than zero.");
+		return false;
+	}
+
+	const FString ResolvedOutputDirectory = ResolveOutputDirectory(OutputDirectory);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PlatformFile.CreateDirectoryTree(*ResolvedOutputDirectory))
+	{
+		OutError = FString::Printf(TEXT("Failed to create output directory: %s"), *ResolvedOutputDirectory);
+		return false;
+	}
+
+	const FString SessionId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+	FRuntimeRecRecordingSession Session;
+	Session.SourceRenderTarget = RenderTarget;
+	Session.ActiveOptions = LocalOptions;
+	Session.CurrentOutputPath = MakeUniqueOutputPath(ResolvedOutputDirectory, FileName);
+	Session.FrameInterval = 1.0 / static_cast<double>(LocalOptions.FPS);
+	Session.AccumulatedTime = 0.0;
+
+	Session.Encoder = new FRuntimeRecVideoEncoder();
+	if (!Session.Encoder->Start(
+		Session.CurrentOutputPath,
+		Session.ActiveOptions.Width,
+		Session.ActiveOptions.Height,
+		Session.ActiveOptions.FPS,
+		Session.ActiveOptions.BitrateKbps,
+		Session.ActiveOptions.bPreferHardwareEncoder,
+		Session.ActiveOptions.bAllowFrameDrop,
+		OutError))
+	{
+		SetError(OutError);
+		delete Session.Encoder;
+		Session.Encoder = nullptr;
+		return false;
+	}
+
+	ActiveRenderTargetSessions.Add(SessionId, MoveTemp(Session));
+	OutSessionId = SessionId;
+	return true;
+}
+
+bool URuntimeRecSubsystem::StopRenderTargetRecordingInternal(
+	const FString& SessionId,
+	FString& OutSavedFilePath,
+	FString& OutError)
+{
+	FRuntimeRecRecordingSession* Session = ActiveRenderTargetSessions.Find(SessionId);
+	if (!Session)
+	{
+		OutError = TEXT("SessionId does not match an active render target recording.");
+		return false;
+	}
+
+	if (Session->Encoder)
+	{
+		if (!Session->Encoder->Stop(OutError))
+		{
+			SetError(OutError);
+			return false;
+		}
+
+		delete Session->Encoder;
+		Session->Encoder = nullptr;
+	}
+
+	OutSavedFilePath = Session->CurrentOutputPath;
+	ClearRenderTargetSession(*Session);
+	ActiveRenderTargetSessions.Remove(SessionId);
+	return true;
+}
+
+void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
+{
+	TArray<FString> SessionIds;
+	ActiveRenderTargetSessions.GetKeys(SessionIds);
+
+	TArray<FString> SessionsToRemove;
+	for (const FString& SessionId : SessionIds)
+	{
+		FRuntimeRecRecordingSession* Session = ActiveRenderTargetSessions.Find(SessionId);
+		if (!Session || !Session->Encoder)
+		{
+			SessionsToRemove.Add(SessionId);
+			continue;
+		}
+
+		Session->AccumulatedTime += DeltaTime;
+		if (Session->AccumulatedTime < Session->FrameInterval)
+		{
+			continue;
+		}
+
+		Session->AccumulatedTime = FMath::Fmod(Session->AccumulatedTime, Session->FrameInterval);
+
+		TArray<FColor> Pixels;
+		int32 CapturedWidth = 0;
+		int32 CapturedHeight = 0;
+		if (!CaptureRenderTargetFrame(Session->SourceRenderTarget.Get(), Pixels, CapturedWidth, CapturedHeight))
+		{
+			SessionsToRemove.Add(SessionId);
+			continue;
+		}
+
+		CropFrameToSize(Pixels, CapturedWidth, CapturedHeight, Session->ActiveOptions.Width, Session->ActiveOptions.Height);
+
+		FString EncodeError;
+		if (!Session->Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
+		{
+			Session->LastError = EncodeError;
+			SetError(EncodeError);
+			SessionsToRemove.Add(SessionId);
+		}
+	}
+
+	for (const FString& SessionId : SessionsToRemove)
+	{
+		FString IgnoredPath;
+		FString IgnoredError;
+		StopRenderTargetRecordingInternal(SessionId, IgnoredPath, IgnoredError);
+	}
+}
+
+bool URuntimeRecSubsystem::HasAnyRenderTargetSessions() const
+{
+	return ActiveRenderTargetSessions.Num() > 0;
+}
+
+void URuntimeRecSubsystem::ClearRenderTargetSession(FRuntimeRecRecordingSession& Session)
+{
+	if (Session.Encoder)
+	{
+		delete Session.Encoder;
+		Session.Encoder = nullptr;
+	}
+
+	Session.SourceRenderTarget.Reset();
+	Session.CurrentOutputPath.Reset();
+	Session.LastError.Reset();
+	Session.AccumulatedTime = 0.0;
+	Session.FrameInterval = 1.0 / 30.0;
 }
 
 void URuntimeRecSubsystem::SetError(const FString& Error)

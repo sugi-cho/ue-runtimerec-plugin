@@ -29,14 +29,12 @@ bool URuntimeRecBlueprintLibrary::StartViewportRecording(
 	const FString& FileName,
 	int32 FPS,
 	int32 BitrateKbps,
-	bool bIncludeUI,
 	FString& OutSessionId,
 	FString& OutError)
 {
 	FRuntimeRecOptions Options;
 	Options.FPS = FPS;
 	Options.BitrateKbps = BitrateKbps;
-	Options.bIncludeUI = bIncludeUI;
 
 	URuntimeRecSubsystem* Subsystem = RuntimeRecBlueprintLibrary::GetSubsystem(WorldContextObject);
 	if (!Subsystem)

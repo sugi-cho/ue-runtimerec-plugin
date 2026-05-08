@@ -19,7 +19,6 @@ public:
 		const FString& FileName,
 		int32 FPS,
 		int32 BitrateKbps,
-		bool bIncludeUI,
 		FString& OutSessionId,
 		FString& OutError);
 

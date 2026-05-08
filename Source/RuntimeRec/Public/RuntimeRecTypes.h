@@ -28,9 +28,6 @@ struct RUNTIMEREC_API FRuntimeRecOptions
 	int32 BitrateKbps = 12000;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UE_RuntimeRec")
-	bool bIncludeUI = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	bool bAllowFrameDrop = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UE_RuntimeRec")

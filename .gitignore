@@ -1,0 +1,18 @@
+# Unreal Engine generated files
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+.vs/
+
+# IDE / build artifacts
+*.VC.db
+*.VC.opendb
+*.sln
+*.xcodeproj
+*.xcworkspace
+*.log
+
+# OS noise
+Thumbs.db
+Desktop.ini

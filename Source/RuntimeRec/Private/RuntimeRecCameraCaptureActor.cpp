@@ -4,8 +4,11 @@
 #include "Camera/CameraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/SceneComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
 #include "Engine/TextureRenderTarget.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "RuntimeRecSubsystem.h"
 
 ARuntimeRecCameraCaptureActor::ARuntimeRecCameraCaptureActor()
 {
@@ -34,6 +37,24 @@ void ARuntimeRecCameraCaptureActor::BeginPlay()
 {
 	Super::BeginPlay();
 	UpdateCaptureConfiguration();
+
+	if (bAutoStartRecording)
+	{
+		FString IgnoredError;
+		StartRecording(IgnoredError);
+	}
+}
+
+void ARuntimeRecCameraCaptureActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (bRecording)
+	{
+		FString IgnoredSavedPath;
+		FString IgnoredError;
+		StopRecording(IgnoredSavedPath, IgnoredError);
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 #if WITH_EDITOR
@@ -47,7 +68,7 @@ void ARuntimeRecCameraCaptureActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (!bCaptureEveryTick)
+	if (!bCaptureEveryTick && !bRecording)
 	{
 		return;
 	}
@@ -67,6 +88,86 @@ bool ARuntimeRecCameraCaptureActor::RefreshCaptureConfiguration()
 {
 	UpdateCaptureConfiguration();
 	return ResolveSourceCameraComponent() != nullptr && GetEffectiveRenderTarget() != nullptr;
+}
+
+bool ARuntimeRecCameraCaptureActor::StartRecording(FString& OutError)
+{
+	if (bRecording)
+	{
+		OutError = TEXT("Recording is already active.");
+		return false;
+	}
+
+	if (!RefreshCaptureConfiguration())
+	{
+		OutError = LastError.IsEmpty() ? TEXT("Failed to configure capture.") : LastError;
+		return false;
+	}
+
+	URuntimeRecSubsystem* Subsystem = ResolveRuntimeRecSubsystem();
+	if (!Subsystem)
+	{
+		OutError = TEXT("RuntimeRec subsystem is not available.");
+		return false;
+	}
+
+	UTextureRenderTarget2D* EffectiveRenderTarget = GetEffectiveRenderTarget();
+	if (!EffectiveRenderTarget)
+	{
+		OutError = TEXT("RenderTarget is not available.");
+		return false;
+	}
+
+	FRuntimeRecOptions Options;
+	Options.FPS = FPS;
+	Options.BitrateKbps = BitrateKbps;
+	Options.bAllowFrameDrop = bAllowFrameDrop;
+	Options.bPreferHardwareEncoder = bPreferHardwareEncoder;
+
+	FString SessionId;
+	if (!Subsystem->StartRenderTargetRecording(EffectiveRenderTarget, OutputDirectory, FileName, Options, SessionId, OutError))
+	{
+		SetError(OutError);
+		return false;
+	}
+
+	bRecording = true;
+	CurrentSessionId = SessionId;
+	CurrentOutputPath = Subsystem->GetCurrentOutputPath();
+	if (SceneCaptureComponent)
+	{
+		SceneCaptureComponent->CaptureScene();
+	}
+	LastError.Reset();
+	return true;
+}
+
+bool ARuntimeRecCameraCaptureActor::StopRecording(FString& OutSavedFilePath, FString& OutError)
+{
+	if (!bRecording)
+	{
+		OutError = TEXT("No active recording.");
+		return false;
+	}
+
+	URuntimeRecSubsystem* Subsystem = ResolveRuntimeRecSubsystem();
+	if (!Subsystem)
+	{
+		OutError = TEXT("RuntimeRec subsystem is not available.");
+		return false;
+	}
+
+	if (!Subsystem->StopRecording(CurrentSessionId, OutSavedFilePath, OutError))
+	{
+		SetError(OutError);
+		return false;
+	}
+
+	bRecording = false;
+	CurrentSessionId.Reset();
+	CurrentOutputPath = OutSavedFilePath;
+	LastError.Reset();
+	return true;
 }
 
 UTextureRenderTarget2D* ARuntimeRecCameraCaptureActor::GetOrCreateRenderTarget()
@@ -178,6 +279,23 @@ void ARuntimeRecCameraCaptureActor::ApplySourceCameraSettings(UCameraComponent* 
 		SceneCaptureComponent->PostProcessSettings = FPostProcessSettings();
 		SceneCaptureComponent->PostProcessBlendWeight = 0.0f;
 	}
+}
+
+URuntimeRecSubsystem* ARuntimeRecCameraCaptureActor::ResolveRuntimeRecSubsystem() const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return nullptr;
+	}
+
+	UGameInstance* GameInstance = World->GetGameInstance();
+	if (!GameInstance)
+	{
+		return nullptr;
+	}
+
+	return GameInstance->GetSubsystem<URuntimeRecSubsystem>();
 }
 
 int32 ARuntimeRecCameraCaptureActor::MakeEvenDimension(int32 Value)

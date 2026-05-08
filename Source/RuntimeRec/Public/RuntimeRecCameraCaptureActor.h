@@ -6,6 +6,7 @@
 
 class ACameraActor;
 class UCameraComponent;
+class URuntimeRecSubsystem;
 class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
 
@@ -19,6 +20,7 @@ public:
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
 #if WITH_EDITOR
 	virtual bool ShouldTickIfViewportsOnly() const override;
@@ -28,10 +30,22 @@ public:
 	bool RefreshCaptureConfiguration();
 
 	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
+	bool StartRecording(FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
+	bool StopRecording(FString& OutSavedFilePath, FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
 	UTextureRenderTarget2D* GetOrCreateRenderTarget();
 
 	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
 	UTextureRenderTarget2D* GetEffectiveRenderTarget() const;
+
+	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
+	bool IsRecording() const { return bRecording; }
+
+	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
+	FString GetCurrentOutputPath() const { return CurrentOutputPath; }
 
 	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
 	FString GetLastError() const { return LastError; }
@@ -58,6 +72,27 @@ public:
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	bool bCaptureEveryTick = true;
 
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
+	FString OutputDirectory;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
+	FString FileName;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording", meta = (ClampMin = "1", ClampMax = "240"))
+	int32 FPS = 30;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording", meta = (ClampMin = "1"))
+	int32 BitrateKbps = 12000;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
+	bool bAllowFrameDrop = true;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
+	bool bPreferHardwareEncoder = true;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
+	bool bAutoStartRecording = true;
+
 private:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "UE_RuntimeRec", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USceneCaptureComponent2D> SceneCaptureComponent;
@@ -65,11 +100,17 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTextureRenderTarget2D> GeneratedRenderTarget;
 
+	UPROPERTY(Transient)
+	bool bRecording = false;
+
 	FString LastError;
+	FString CurrentSessionId;
+	FString CurrentOutputPath;
 
 	UCameraComponent* ResolveSourceCameraComponent() const;
 	void UpdateCaptureConfiguration();
 	void ApplySourceCameraSettings(UCameraComponent* CameraComponent);
+	URuntimeRecSubsystem* ResolveRuntimeRecSubsystem() const;
 	static int32 MakeEvenDimension(int32 Value);
 	void SetError(const FString& Error);
 };

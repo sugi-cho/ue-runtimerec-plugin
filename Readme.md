@@ -83,9 +83,9 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 
 - H.264 の都合上、RenderTarget の幅と高さは偶数である必要があります。
 
-### Camera から RenderTarget を自動生成するアクター
+### Camera から RenderTarget を自動生成して録画するアクター
 
-`RuntimeRecCameraCaptureActor` をレベルに配置すると、指定した `CameraActor` の映像を `TextureRenderTarget2D` に書き込みできます。
+`RuntimeRecCameraCaptureActor` をレベルに配置すると、指定した `CameraActor` の映像を `TextureRenderTarget2D` に書き込み、そのまま MP4 録画まで行えます。
 
 使い方:
 
@@ -94,8 +94,10 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 3. `TargetRenderTarget` を設定するか、空のままにして自動生成を使います。
 4. 必要なら `RenderTargetWidth` / `RenderTargetHeight` を設定します。
 5. `bIncludeCameraPostProcess` でカメラの PostProcess を反映するか切り替えます。
-6. 生成された `RenderTarget` を `StartRenderTargetRecording` に渡して録画します。
-7. PIE を開始しなくても、レベルビューポート表示中に自動更新します。
+6. `OutputDirectory` / `FileName` / `FPS` / `BitrateKbps` を設定します。
+7. `bAutoStartRecording` を有効にすると、`BeginPlay` で自動録画を開始します。
+8. 手動開始したい場合は `StartRecording` を呼びます。
+9. PIE を開始しなくても、レベルビューポート表示中に自動更新します。
 
 補足:
 
@@ -105,6 +107,7 @@ RenderTarget の `SizeX` / `SizeY` が録画解像度として使われます。
 - `bIncludeCameraPostProcess=true` の場合は、カメラの PostProcessSettings を反映します。
 - `bIncludeCameraPostProcess=false` の場合は、PostProcess を無効化した映像になります。
 - UI はこの経路でも録画されません。
+- 録画停止は `StopRecording` で行います。
 
 ### 録画停止
 

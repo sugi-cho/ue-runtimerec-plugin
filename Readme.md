@@ -11,7 +11,7 @@ Unreal Engine の Runtime 実行中に、Viewport または `UTextureRenderTarge
 
 ## 有効化
 
-このプロジェクトでは、`RuntimeRecPlugin.uproject` に以下のプラグイン設定を追加済みです。
+対象プロジェクトの `.uproject` に以下のプラグイン設定を追加してください。
 
 ```json
 {
@@ -180,9 +180,9 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 以下のビルドが成功することを確認済みです。
 
 ```powershell
-& "C:\Program Files\Epic Games\UE_5.7\Engine\Build\BatchFiles\Build.bat" RuntimeRecPluginEditor Win64 Development -Project="C:\Users\stu\sources\sugi-cho\UE_RuntimeRec\RuntimeRecPlugin\RuntimeRecPlugin.uproject" -WaitMutex -NoHotReloadFromIDE
-& "C:\Program Files\Epic Games\UE_5.7\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Development -Project="C:\Users\stu\sources\sugi-cho\UE_RuntimeRec\RuntimeRecPlugin\RuntimeRecPlugin.uproject" -WaitMutex -NoHotReloadFromIDE
-& "C:\Program Files\Epic Games\UE_5.7\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Shipping -Project="C:\Users\stu\sources\sugi-cho\UE_RuntimeRec\RuntimeRecPlugin\RuntimeRecPlugin.uproject" -WaitMutex -NoHotReloadFromIDE
+& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPluginEditor Win64 Development -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
+& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Development -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
+& "<UE5_ROOT>\Engine\Build\BatchFiles\Build.bat" RuntimeRecPlugin Win64 Shipping -Project="<PROJECT_UPROJECT>" -WaitMutex -NoHotReloadFromIDE
 ```
 
 Editor起動中に Live Coding が有効な場合、通常ビルドが止まることがあります。その場合は Editor 側で Live Coding を停止するか、上記のように `-NoHotReloadFromIDE` を指定してください。

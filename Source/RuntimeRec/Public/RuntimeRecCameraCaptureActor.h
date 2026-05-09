@@ -5,6 +5,7 @@
 #include "RuntimeRecCameraCaptureActor.generated.h"
 
 class ACameraActor;
+class APawn;
 class UCameraComponent;
 class URuntimeRecSubsystem;
 class USceneCaptureComponent2D;
@@ -53,6 +54,9 @@ public:
 public:
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	TObjectPtr<ACameraActor> SourceCamera;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
+	TObjectPtr<APawn> SourcePawn;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	TObjectPtr<UTextureRenderTarget2D> TargetRenderTarget;
@@ -108,6 +112,7 @@ private:
 	FString CurrentOutputPath;
 
 	UCameraComponent* ResolveSourceCameraComponent() const;
+	UCameraComponent* ResolvePawnCameraComponent() const;
 	void UpdateCaptureConfiguration();
 	void ApplySourceCameraSettings(UCameraComponent* CameraComponent);
 	URuntimeRecSubsystem* ResolveRuntimeRecSubsystem() const;

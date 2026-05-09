@@ -2,7 +2,7 @@
 	"FileVersion": 3,
 	"Version": 1,
 	"VersionName": "0.1.0",
-	"FriendlyName": "Runtime Rec",
+	"FriendlyName": "UnrealRuntimeRec",
 	"Description": "Runtime viewport and render target recording to MP4.",
 	"Category": "Recording",
 	"CreatedBy": "sugi-cho",

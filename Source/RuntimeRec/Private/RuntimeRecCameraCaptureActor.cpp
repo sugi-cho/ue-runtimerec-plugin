@@ -8,6 +8,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/TextureRenderTarget.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "GameFramework/Pawn.h"
 #include "RuntimeRecSubsystem.h"
 
 ARuntimeRecCameraCaptureActor::ARuntimeRecCameraCaptureActor()
@@ -211,10 +212,25 @@ UCameraComponent* ARuntimeRecCameraCaptureActor::ResolveSourceCameraComponent() 
 {
 	if (!SourceCamera)
 	{
+		return ResolvePawnCameraComponent();
+	}
+
+	if (UCameraComponent* CameraComponent = SourceCamera->GetCameraComponent())
+	{
+		return CameraComponent;
+	}
+
+	return ResolvePawnCameraComponent();
+}
+
+UCameraComponent* ARuntimeRecCameraCaptureActor::ResolvePawnCameraComponent() const
+{
+	if (!SourcePawn)
+	{
 		return nullptr;
 	}
 
-	return SourceCamera->GetCameraComponent();
+	return SourcePawn->FindComponentByClass<UCameraComponent>();
 }
 
 void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration()

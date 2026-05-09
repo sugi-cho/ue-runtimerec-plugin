@@ -70,6 +70,12 @@ void ARuntimeRecCameraCaptureActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	if (!bCaptureActive && !bRecording)
+	{
+		ApplyCaptureActivity();
+		return;
+	}
+
 	if (bAutoAssignSourcePawnFromPlayerController && !SourcePawn)
 	{
 		UpdateCaptureConfiguration(true);
@@ -104,6 +110,8 @@ bool ARuntimeRecCameraCaptureActor::StartRecording(FString& OutError)
 		OutError = TEXT("Recording is already active.");
 		return false;
 	}
+
+	SetCaptureActive(true);
 
 	if (!RefreshCaptureConfiguration())
 	{
@@ -147,6 +155,12 @@ bool ARuntimeRecCameraCaptureActor::StartRecording(FString& OutError)
 	}
 	LastError.Reset();
 	return true;
+}
+
+void ARuntimeRecCameraCaptureActor::SetCaptureActive(bool bNewActive)
+{
+	bCaptureActive = bNewActive;
+	ApplyCaptureActivity();
 }
 
 void ARuntimeRecCameraCaptureActor::StartRecordingEditor()
@@ -233,6 +247,25 @@ UTextureRenderTarget2D* ARuntimeRecCameraCaptureActor::GetEffectiveRenderTarget(
 	return GeneratedRenderTarget;
 }
 
+void ARuntimeRecCameraCaptureActor::ApplyCaptureActivity()
+{
+	if (!SceneCaptureComponent)
+	{
+		return;
+	}
+
+	if (bCaptureActive || bRecording)
+	{
+		SceneCaptureComponent->Activate(true);
+		SceneCaptureComponent->SetComponentTickEnabled(true);
+	}
+	else
+	{
+		SceneCaptureComponent->Deactivate();
+		SceneCaptureComponent->SetComponentTickEnabled(false);
+	}
+}
+
 UCameraComponent* ARuntimeRecCameraCaptureActor::ResolveSourceCameraComponent(bool bAllowPendingAutoSource) const
 {
 	if (!SourceCamera)
@@ -273,6 +306,14 @@ void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration(bool bAllowPendin
 {
 	if (!SceneCaptureComponent)
 	{
+		return;
+	}
+
+	ApplyCaptureActivity();
+
+	if (!bCaptureActive && !bRecording)
+	{
+		LastError.Reset();
 		return;
 	}
 

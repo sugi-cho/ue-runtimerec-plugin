@@ -36,6 +36,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
 	bool StopRecording(FString& OutSavedFilePath, FString& OutError);
 
+	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
+	void SetCaptureActive(bool bNewActive);
+
+	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
+	bool IsCaptureActive() const { return bCaptureActive; }
+
 	UFUNCTION(CallInEditor, Category = "UE_RuntimeRec|Editor", meta = (DisplayName = "Start Recording"))
 	void StartRecordingEditor();
 
@@ -91,6 +97,9 @@ public:
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	bool bCaptureEveryTick = true;
 
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
+	bool bCaptureActive = true;
+
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Recording")
 	FString OutputDirectory;
 
@@ -129,6 +138,7 @@ private:
 	UCameraComponent* ResolveSourceCameraComponent(bool bAllowPendingAutoSource) const;
 	UCameraComponent* ResolvePawnCameraComponent(bool bAllowPendingAutoSource) const;
 	void UpdateCaptureConfiguration(bool bAllowPendingAutoSource);
+	void ApplyCaptureActivity();
 	void ApplySourceCameraSettings(UCameraComponent* CameraComponent);
 	URuntimeRecSubsystem* ResolveRuntimeRecSubsystem() const;
 	APawn* ResolveAutoSourcePawn() const;

@@ -101,6 +101,7 @@ bool ARuntimeRecRecordingGroupActor::StartRecording(FString& OutError)
 			goto Fail;
 		}
 
+		CameraCaptureActor->SetCaptureActive(true);
 		if (!CameraCaptureActor->RefreshCaptureConfiguration())
 		{
 			OutError = FString::Printf(TEXT("Failed to refresh camera capture actor %d."), Index);

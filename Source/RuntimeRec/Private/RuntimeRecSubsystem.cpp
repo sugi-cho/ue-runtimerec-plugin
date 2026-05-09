@@ -3,11 +3,50 @@
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/App.h"
 #include "Misc/DateTime.h"
 #include "Misc/Paths.h"
+#include "RenderingThread.h"
+#include "RHICommandList.h"
+#include "RHIGPUReadback.h"
+#include "RuntimeRecGpuVideoEncoder.h"
 #include "RuntimeRecVideoEncoder.h"
+#include "TextureResource.h"
+
+namespace
+{
+	constexpr int32 RuntimeRecMaxPendingReadbacks = 3;
+	constexpr int32 RuntimeRecMaxPendingGpuEncodes = 3;
+
+	void CopyReadbackRowsToPixels(
+		const void* SourceData,
+		int32 SourceRowPitchInPixels,
+		int32 Width,
+		int32 Height,
+		TArray<FColor>& OutPixels)
+	{
+		OutPixels.SetNumUninitialized(Width * Height);
+
+		const FColor* SourcePixels = static_cast<const FColor*>(SourceData);
+		FColor* DestinationPixels = OutPixels.GetData();
+
+		if (SourceRowPitchInPixels == Width)
+		{
+			FMemory::Memcpy(DestinationPixels, SourcePixels, Width * Height * sizeof(FColor));
+			return;
+		}
+
+		for (int32 RowIndex = 0; RowIndex < Height; ++RowIndex)
+		{
+			FMemory::Memcpy(
+				DestinationPixels + RowIndex * Width,
+				SourcePixels + RowIndex * SourceRowPitchInPixels,
+				Width * sizeof(FColor));
+		}
+	}
+}
 
 void URuntimeRecSubsystem::Deinitialize()
 {
@@ -352,20 +391,56 @@ bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
 	Session.FrameInterval = 1.0 / static_cast<double>(LocalOptions.FPS);
 	Session.AccumulatedTime = 0.0;
 
-	Session.Encoder = new FRuntimeRecVideoEncoder();
-	if (!Session.Encoder->Start(
-		Session.CurrentOutputPath,
-		Session.ActiveOptions.Width,
-		Session.ActiveOptions.Height,
-		Session.ActiveOptions.FPS,
-		Session.ActiveOptions.BitrateKbps,
-		Session.ActiveOptions.bPreferHardwareEncoder,
-		Session.ActiveOptions.bAllowFrameDrop,
-		OutError))
+	const bool bRenderTargetCanUseGpuEncoder =
+		RenderTarget->GetFormat() == PF_B8G8R8A8 &&
+		RenderTarget->GetSampleCount() == ETextureRenderTargetSampleCount::RTSC_1 &&
+		RenderTarget->SizeX == LocalOptions.Width &&
+		RenderTarget->SizeY == LocalOptions.Height;
+
+	if (bRenderTargetCanUseGpuEncoder && FRuntimeRecGpuVideoEncoder::IsPreferred())
 	{
-		SetError(OutError);
-		delete Session.Encoder;
-		Session.Encoder = nullptr;
+		Session.GpuEncoder = MakeShared<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe>();
+		FString GpuEncoderError;
+		if (!Session.GpuEncoder->Start(
+			Session.CurrentOutputPath,
+			Session.ActiveOptions.Width,
+			Session.ActiveOptions.Height,
+			Session.ActiveOptions.FPS,
+			Session.ActiveOptions.BitrateKbps,
+			GpuEncoderError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: GPU encoder unavailable; falling back to async readback. %s"), *GpuEncoderError);
+			Session.GpuEncoder.Reset();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Display, TEXT("RuntimeRec: Using GPU video encoder for RenderTarget recording."));
+		}
+	}
+
+	if (!Session.GpuEncoder.IsValid())
+	{
+		Session.Encoder = new FRuntimeRecVideoEncoder();
+		if (!Session.Encoder->Start(
+			Session.CurrentOutputPath,
+			Session.ActiveOptions.Width,
+			Session.ActiveOptions.Height,
+			Session.ActiveOptions.FPS,
+			Session.ActiveOptions.BitrateKbps,
+			Session.ActiveOptions.bPreferHardwareEncoder,
+			Session.ActiveOptions.bAllowFrameDrop,
+			OutError))
+		{
+			SetError(OutError);
+			delete Session.Encoder;
+			Session.Encoder = nullptr;
+			return false;
+		}
+	}
+
+	if (!Session.Encoder && !Session.GpuEncoder.IsValid())
+	{
+		OutError = TEXT("Failed to start a recording encoder.");
 		return false;
 	}
 
@@ -384,6 +459,17 @@ bool URuntimeRecSubsystem::StopRenderTargetRecordingInternal(
 	{
 		OutError = TEXT("SessionId does not match an active render target recording.");
 		return false;
+	}
+
+	if (Session->GpuEncoder.IsValid())
+	{
+		FlushRenderingCommands();
+		if (!Session->GpuEncoder->Stop(OutError))
+		{
+			SetError(OutError);
+			return false;
+		}
+		Session->GpuEncoder.Reset();
 	}
 
 	if (Session->Encoder)
@@ -413,9 +499,21 @@ void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
 	for (const FString& SessionId : SessionIds)
 	{
 		FRuntimeRecRecordingSession* Session = ActiveRenderTargetSessions.Find(SessionId);
-		if (!Session || !Session->Encoder)
+		if (!Session || (!Session->Encoder && !Session->GpuEncoder.IsValid()))
 		{
 			SessionsToRemove.Add(SessionId);
+			continue;
+		}
+
+		PollRenderTargetGpuEncodes(SessionId, *Session, SessionsToRemove);
+		if (SessionsToRemove.Contains(SessionId))
+		{
+			continue;
+		}
+
+		PollRenderTargetReadbacks(SessionId, *Session, SessionsToRemove);
+		if (SessionsToRemove.Contains(SessionId))
+		{
 			continue;
 		}
 
@@ -427,23 +525,26 @@ void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
 
 		Session->AccumulatedTime = FMath::Fmod(Session->AccumulatedTime, Session->FrameInterval);
 
-		TArray<FColor> Pixels;
-		int32 CapturedWidth = 0;
-		int32 CapturedHeight = 0;
-		if (!CaptureRenderTargetFrame(Session->SourceRenderTarget.Get(), Pixels, CapturedWidth, CapturedHeight))
+		FString CaptureError;
+		bool bCanUseReadPixelsFallback = false;
+		bool bQueuedFrame = false;
+		if (Session->GpuEncoder.IsValid())
 		{
-			SessionsToRemove.Add(SessionId);
-			continue;
+			bQueuedFrame = QueueRenderTargetGpuEncode(*Session, CaptureError, bCanUseReadPixelsFallback);
+		}
+		else
+		{
+			bQueuedFrame = QueueRenderTargetReadback(*Session, CaptureError, bCanUseReadPixelsFallback);
 		}
 
-		CropFrameToSize(Pixels, CapturedWidth, CapturedHeight, Session->ActiveOptions.Width, Session->ActiveOptions.Height);
-
-		FString EncodeError;
-		if (!Session->Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
+		if (!bQueuedFrame)
 		{
-			Session->LastError = EncodeError;
-			SetError(EncodeError);
-			SessionsToRemove.Add(SessionId);
+			if (!bCanUseReadPixelsFallback || !CaptureRenderTargetFrameFallback(*Session, CaptureError))
+			{
+				Session->LastError = CaptureError;
+				SetError(CaptureError);
+				SessionsToRemove.Add(SessionId);
+			}
 		}
 	}
 
@@ -455,6 +556,402 @@ void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
 	}
 }
 
+void URuntimeRecSubsystem::PollRenderTargetReadbacks(
+	const FString& SessionId,
+	FRuntimeRecRecordingSession& Session,
+	TArray<FString>& SessionsToRemove)
+{
+	for (int32 RequestIndex = 0; RequestIndex < Session.PendingReadbacks.Num();)
+	{
+		TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe> Request = Session.PendingReadbacks[RequestIndex];
+		if (!Request.IsValid() || Request->bCancelled)
+		{
+			Session.PendingReadbacks.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bSkipped)
+		{
+			Session.PendingReadbacks.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bHadError)
+		{
+			Session.LastError = Request->Error.IsEmpty() ? TEXT("Async render target readback failed.") : Request->Error;
+			SetError(Session.LastError);
+			SessionsToRemove.AddUnique(SessionId);
+			return;
+		}
+
+		if (Request->bReadyForEncode)
+		{
+			FString EncodeError;
+			if (!Session.Encoder->EnqueueFrame(MoveTemp(Request->Pixels), EncodeError))
+			{
+				Session.LastError = EncodeError;
+				SetError(EncodeError);
+				SessionsToRemove.AddUnique(SessionId);
+				return;
+			}
+
+			Session.PendingReadbacks.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (!Request->bCheckQueued)
+		{
+			Request->bCheckQueued = true;
+			ENQUEUE_RENDER_COMMAND(RuntimeRecPollRenderTargetReadback)(
+				[Request](FRHICommandListImmediate& RHICmdList)
+				{
+					if (Request->bCancelled)
+					{
+						Request->bCheckQueued = false;
+						return;
+					}
+
+					if (!Request->Readback.IsValid())
+					{
+						Request->Error = TEXT("Async readback object is not available.");
+						Request->bHadError = true;
+						Request->bCheckQueued = false;
+						return;
+					}
+
+					if (!Request->Readback->IsReady())
+					{
+						Request->bCheckQueued = false;
+						return;
+					}
+
+					int32 RowPitchInPixels = 0;
+					int32 BufferHeight = 0;
+					void* SourceData = Request->Readback->Lock(RowPitchInPixels, &BufferHeight);
+					if (!SourceData || RowPitchInPixels < Request->Width || BufferHeight < Request->Height)
+					{
+						if (SourceData)
+						{
+							Request->Readback->Unlock();
+						}
+
+						Request->Error = TEXT("Async readback returned an invalid buffer.");
+						Request->bHadError = true;
+						Request->bCheckQueued = false;
+						return;
+					}
+
+					CopyReadbackRowsToPixels(
+						SourceData,
+						RowPitchInPixels,
+						Request->Width,
+						Request->Height,
+						Request->Pixels);
+
+					Request->Readback->Unlock();
+					Request->Readback.Reset();
+					Request->bReadyForEncode = true;
+					Request->bCheckQueued = false;
+				});
+		}
+
+		++RequestIndex;
+	}
+}
+
+void URuntimeRecSubsystem::PollRenderTargetGpuEncodes(
+	const FString& SessionId,
+	FRuntimeRecRecordingSession& Session,
+	TArray<FString>& SessionsToRemove)
+{
+	for (int32 RequestIndex = 0; RequestIndex < Session.PendingGpuEncodes.Num();)
+	{
+		TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> Request = Session.PendingGpuEncodes[RequestIndex];
+		if (!Request.IsValid() || Request->bCancelled)
+		{
+			Session.PendingGpuEncodes.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bSkipped || Request->bDone)
+		{
+			Session.PendingGpuEncodes.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bHadError)
+		{
+			const FString GpuError = Request->Error.IsEmpty() ? TEXT("GPU render target encode failed.") : Request->Error;
+			FString FallbackError;
+			if (!FallbackRenderTargetSessionToReadback(Session, GpuError, FallbackError))
+			{
+				Session.LastError = FallbackError;
+				SetError(Session.LastError);
+				SessionsToRemove.AddUnique(SessionId);
+			}
+			return;
+		}
+
+		++RequestIndex;
+	}
+}
+
+bool URuntimeRecSubsystem::QueueRenderTargetGpuEncode(
+	FRuntimeRecRecordingSession& Session,
+	FString& OutError,
+	bool& bOutCanUseReadPixelsFallback)
+{
+	bOutCanUseReadPixelsFallback = false;
+
+	UTextureRenderTarget2D* RenderTarget = Session.SourceRenderTarget.Get();
+	if (!RenderTarget)
+	{
+		OutError = TEXT("RenderTarget is no longer valid.");
+		return false;
+	}
+
+	if (!Session.GpuEncoder.IsValid())
+	{
+		OutError = TEXT("GPU encoder is not available.");
+		return false;
+	}
+
+	FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+	if (!Resource)
+	{
+		OutError = TEXT("RenderTarget resource is not available.");
+		return false;
+	}
+
+	if (Session.PendingGpuEncodes.Num() >= RuntimeRecMaxPendingGpuEncodes)
+	{
+		if (!Session.ActiveOptions.bAllowFrameDrop)
+		{
+			OutError = TEXT("GPU encode queue is full.");
+			return false;
+		}
+
+		if (TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> DroppedRequest = Session.PendingGpuEncodes[0])
+		{
+			DroppedRequest->bCancelled = true;
+		}
+		Session.PendingGpuEncodes.RemoveAt(0);
+	}
+
+	TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> Request = MakeShared<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>();
+	TSharedPtr<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe> GpuEncoder = Session.GpuEncoder;
+	const int64 FrameIndex = Session.NextCaptureFrameIndex++;
+
+	Session.PendingGpuEncodes.Add(Request);
+
+	ENQUEUE_RENDER_COMMAND(RuntimeRecQueueRenderTargetGpuEncode)(
+		[Request, GpuEncoder, Resource, FrameIndex](FRHICommandListImmediate& RHICmdList)
+		{
+			if (Request->bCancelled)
+			{
+				return;
+			}
+
+			if (!GpuEncoder.IsValid() || !GpuEncoder->IsStarted())
+			{
+				Request->bSkipped = true;
+				return;
+			}
+
+			const FTextureRHIRef SourceTexture = Resource->GetRenderTargetTexture();
+			if (!SourceTexture.IsValid())
+			{
+				Request->bSkipped = true;
+				return;
+			}
+
+			FString EncodeError;
+			if (!GpuEncoder->EncodeTexture_RenderThread(RHICmdList, SourceTexture, FrameIndex, EncodeError))
+			{
+				Request->Error = EncodeError;
+				Request->bHadError = true;
+				return;
+			}
+
+			Request->bDone = true;
+		});
+
+	return true;
+}
+
+bool URuntimeRecSubsystem::FallbackRenderTargetSessionToReadback(
+	FRuntimeRecRecordingSession& Session,
+	const FString& Reason,
+	FString& OutError)
+{
+	if (Session.Encoder)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>& Request : Session.PendingGpuEncodes)
+	{
+		if (Request.IsValid())
+		{
+			Request->bCancelled = true;
+		}
+	}
+	Session.PendingGpuEncodes.Reset();
+
+	if (Session.GpuEncoder.IsValid())
+	{
+		FlushRenderingCommands();
+
+		FString IgnoredGpuStopError;
+		Session.GpuEncoder->Stop(IgnoredGpuStopError);
+		Session.GpuEncoder.Reset();
+	}
+
+	if (!Session.CurrentOutputPath.IsEmpty() && IFileManager::Get().FileExists(*Session.CurrentOutputPath))
+	{
+		IFileManager::Get().Delete(*Session.CurrentOutputPath, false, true);
+	}
+
+	Session.Encoder = new FRuntimeRecVideoEncoder();
+	if (!Session.Encoder->Start(
+		Session.CurrentOutputPath,
+		Session.ActiveOptions.Width,
+		Session.ActiveOptions.Height,
+		Session.ActiveOptions.FPS,
+		Session.ActiveOptions.BitrateKbps,
+		Session.ActiveOptions.bPreferHardwareEncoder,
+		Session.ActiveOptions.bAllowFrameDrop,
+		OutError))
+	{
+		delete Session.Encoder;
+		Session.Encoder = nullptr;
+		return false;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: GPU encode failed; falling back to async readback. %s"), *Reason);
+	return true;
+}
+
+bool URuntimeRecSubsystem::QueueRenderTargetReadback(
+	FRuntimeRecRecordingSession& Session,
+	FString& OutError,
+	bool& bOutCanUseReadPixelsFallback)
+{
+	bOutCanUseReadPixelsFallback = false;
+
+	UTextureRenderTarget2D* RenderTarget = Session.SourceRenderTarget.Get();
+	if (!RenderTarget)
+	{
+		OutError = TEXT("RenderTarget is no longer valid.");
+		return false;
+	}
+
+	FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+	if (!Resource)
+	{
+		OutError = TEXT("RenderTarget resource is not available.");
+		return false;
+	}
+
+	if (RenderTarget->GetFormat() != PF_B8G8R8A8 || RenderTarget->GetSampleCount() != ETextureRenderTargetSampleCount::RTSC_1)
+	{
+		OutError = TEXT("RenderTarget format is not supported by async readback; falling back to ReadPixels.");
+		bOutCanUseReadPixelsFallback = true;
+		return false;
+	}
+
+	if (Session.PendingReadbacks.Num() >= RuntimeRecMaxPendingReadbacks)
+	{
+		if (!Session.ActiveOptions.bAllowFrameDrop)
+		{
+			OutError = TEXT("Async readback queue is full.");
+			return false;
+		}
+
+		if (TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe> DroppedRequest = Session.PendingReadbacks[0])
+		{
+			DroppedRequest->bCancelled = true;
+		}
+		Session.PendingReadbacks.RemoveAt(0);
+	}
+
+	TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe> Request = MakeShared<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe>();
+	Request->Readback = MakeShared<FRHIGPUTextureReadback, ESPMode::ThreadSafe>(TEXT("RuntimeRecRenderTargetReadback"));
+	Request->Width = Session.ActiveOptions.Width;
+	Request->Height = Session.ActiveOptions.Height;
+	Request->CaptureFrameIndex = Session.NextCaptureFrameIndex++;
+
+	Session.PendingReadbacks.Add(Request);
+
+	ENQUEUE_RENDER_COMMAND(RuntimeRecQueueRenderTargetReadback)(
+		[Request, Resource](FRHICommandListImmediate& RHICmdList)
+		{
+			if (Request->bCancelled)
+			{
+				return;
+			}
+
+			const FTextureRHIRef SourceTexture = Resource->GetRenderTargetTexture();
+			if (!SourceTexture.IsValid())
+			{
+				Request->bSkipped = true;
+				return;
+			}
+
+			const FRHITextureDesc& TextureDesc = SourceTexture->GetDesc();
+			if (TextureDesc.Format != PF_B8G8R8A8 || TextureDesc.IsMultisample())
+			{
+				Request->Error = TEXT("RenderTarget RHI texture is not compatible with async readback.");
+				Request->bHadError = true;
+				return;
+			}
+
+			RHICmdList.Transition(FRHITransitionInfo(SourceTexture, ERHIAccess::Unknown, ERHIAccess::CopySrc));
+			Request->Readback->EnqueueCopy(
+				RHICmdList,
+				SourceTexture,
+				FIntVector(0, 0, 0),
+				0,
+				FIntVector(Request->Width, Request->Height, 1));
+		});
+
+	return true;
+}
+
+bool URuntimeRecSubsystem::CaptureRenderTargetFrameFallback(FRuntimeRecRecordingSession& Session, FString& OutError)
+{
+	TArray<FColor> Pixels;
+	int32 CapturedWidth = 0;
+	int32 CapturedHeight = 0;
+	if (!CaptureRenderTargetFrame(Session.SourceRenderTarget.Get(), Pixels, CapturedWidth, CapturedHeight))
+	{
+		OutError = LastError.IsEmpty() ? TEXT("Failed to read render target pixels.") : LastError;
+		return false;
+	}
+
+	CropFrameToSize(Pixels, CapturedWidth, CapturedHeight, Session.ActiveOptions.Width, Session.ActiveOptions.Height);
+	if (Pixels.Num() != Session.ActiveOptions.Width * Session.ActiveOptions.Height)
+	{
+		OutError = TEXT("Captured render target frame size is invalid.");
+		return false;
+	}
+
+	FString EncodeError;
+	if (!Session.Encoder)
+	{
+		OutError = TEXT("CPU encoder is not available for ReadPixels fallback.");
+		return false;
+	}
+
+	if (!Session.Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
+	{
+		OutError = EncodeError;
+		return false;
+	}
+
+	return true;
+}
+
 bool URuntimeRecSubsystem::HasAnyRenderTargetSessions() const
 {
 	return ActiveRenderTargetSessions.Num() > 0;
@@ -462,6 +959,31 @@ bool URuntimeRecSubsystem::HasAnyRenderTargetSessions() const
 
 void URuntimeRecSubsystem::ClearRenderTargetSession(FRuntimeRecRecordingSession& Session)
 {
+	for (const TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe>& Request : Session.PendingReadbacks)
+	{
+		if (Request.IsValid())
+		{
+			Request->bCancelled = true;
+		}
+	}
+	Session.PendingReadbacks.Reset();
+
+	for (const TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>& Request : Session.PendingGpuEncodes)
+	{
+		if (Request.IsValid())
+		{
+			Request->bCancelled = true;
+		}
+	}
+	Session.PendingGpuEncodes.Reset();
+
+	if (Session.GpuEncoder.IsValid())
+	{
+		FString IgnoredError;
+		Session.GpuEncoder->Stop(IgnoredError);
+		Session.GpuEncoder.Reset();
+	}
+
 	if (Session.Encoder)
 	{
 		delete Session.Encoder;
@@ -473,6 +995,7 @@ void URuntimeRecSubsystem::ClearRenderTargetSession(FRuntimeRecRecordingSession&
 	Session.LastError.Reset();
 	Session.AccumulatedTime = 0.0;
 	Session.FrameInterval = 1.0 / 30.0;
+	Session.NextCaptureFrameIndex = 0;
 }
 
 void URuntimeRecSubsystem::SetError(const FString& Error)

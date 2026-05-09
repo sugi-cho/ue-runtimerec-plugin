@@ -3,6 +3,7 @@
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/App.h"
 #include "Misc/DateTime.h"
@@ -10,12 +11,14 @@
 #include "RenderingThread.h"
 #include "RHICommandList.h"
 #include "RHIGPUReadback.h"
+#include "RuntimeRecGpuVideoEncoder.h"
 #include "RuntimeRecVideoEncoder.h"
 #include "TextureResource.h"
 
 namespace
 {
 	constexpr int32 RuntimeRecMaxPendingReadbacks = 3;
+	constexpr int32 RuntimeRecMaxPendingGpuEncodes = 3;
 
 	void CopyReadbackRowsToPixels(
 		const void* SourceData,
@@ -388,20 +391,56 @@ bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
 	Session.FrameInterval = 1.0 / static_cast<double>(LocalOptions.FPS);
 	Session.AccumulatedTime = 0.0;
 
-	Session.Encoder = new FRuntimeRecVideoEncoder();
-	if (!Session.Encoder->Start(
-		Session.CurrentOutputPath,
-		Session.ActiveOptions.Width,
-		Session.ActiveOptions.Height,
-		Session.ActiveOptions.FPS,
-		Session.ActiveOptions.BitrateKbps,
-		Session.ActiveOptions.bPreferHardwareEncoder,
-		Session.ActiveOptions.bAllowFrameDrop,
-		OutError))
+	const bool bRenderTargetCanUseGpuEncoder =
+		RenderTarget->GetFormat() == PF_B8G8R8A8 &&
+		RenderTarget->GetSampleCount() == ETextureRenderTargetSampleCount::RTSC_1 &&
+		RenderTarget->SizeX == LocalOptions.Width &&
+		RenderTarget->SizeY == LocalOptions.Height;
+
+	if (bRenderTargetCanUseGpuEncoder && FRuntimeRecGpuVideoEncoder::IsPreferred())
 	{
-		SetError(OutError);
-		delete Session.Encoder;
-		Session.Encoder = nullptr;
+		Session.GpuEncoder = MakeShared<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe>();
+		FString GpuEncoderError;
+		if (!Session.GpuEncoder->Start(
+			Session.CurrentOutputPath,
+			Session.ActiveOptions.Width,
+			Session.ActiveOptions.Height,
+			Session.ActiveOptions.FPS,
+			Session.ActiveOptions.BitrateKbps,
+			GpuEncoderError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: GPU encoder unavailable; falling back to async readback. %s"), *GpuEncoderError);
+			Session.GpuEncoder.Reset();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Display, TEXT("RuntimeRec: Using GPU video encoder for RenderTarget recording."));
+		}
+	}
+
+	if (!Session.GpuEncoder.IsValid())
+	{
+		Session.Encoder = new FRuntimeRecVideoEncoder();
+		if (!Session.Encoder->Start(
+			Session.CurrentOutputPath,
+			Session.ActiveOptions.Width,
+			Session.ActiveOptions.Height,
+			Session.ActiveOptions.FPS,
+			Session.ActiveOptions.BitrateKbps,
+			Session.ActiveOptions.bPreferHardwareEncoder,
+			Session.ActiveOptions.bAllowFrameDrop,
+			OutError))
+		{
+			SetError(OutError);
+			delete Session.Encoder;
+			Session.Encoder = nullptr;
+			return false;
+		}
+	}
+
+	if (!Session.Encoder && !Session.GpuEncoder.IsValid())
+	{
+		OutError = TEXT("Failed to start a recording encoder.");
 		return false;
 	}
 
@@ -420,6 +459,17 @@ bool URuntimeRecSubsystem::StopRenderTargetRecordingInternal(
 	{
 		OutError = TEXT("SessionId does not match an active render target recording.");
 		return false;
+	}
+
+	if (Session->GpuEncoder.IsValid())
+	{
+		FlushRenderingCommands();
+		if (!Session->GpuEncoder->Stop(OutError))
+		{
+			SetError(OutError);
+			return false;
+		}
+		Session->GpuEncoder.Reset();
 	}
 
 	if (Session->Encoder)
@@ -449,9 +499,15 @@ void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
 	for (const FString& SessionId : SessionIds)
 	{
 		FRuntimeRecRecordingSession* Session = ActiveRenderTargetSessions.Find(SessionId);
-		if (!Session || !Session->Encoder)
+		if (!Session || (!Session->Encoder && !Session->GpuEncoder.IsValid()))
 		{
 			SessionsToRemove.Add(SessionId);
+			continue;
+		}
+
+		PollRenderTargetGpuEncodes(SessionId, *Session, SessionsToRemove);
+		if (SessionsToRemove.Contains(SessionId))
+		{
 			continue;
 		}
 
@@ -471,7 +527,17 @@ void URuntimeRecSubsystem::TickRenderTargetSessions(float DeltaTime)
 
 		FString CaptureError;
 		bool bCanUseReadPixelsFallback = false;
-		if (!QueueRenderTargetReadback(*Session, CaptureError, bCanUseReadPixelsFallback))
+		bool bQueuedFrame = false;
+		if (Session->GpuEncoder.IsValid())
+		{
+			bQueuedFrame = QueueRenderTargetGpuEncode(*Session, CaptureError, bCanUseReadPixelsFallback);
+		}
+		else
+		{
+			bQueuedFrame = QueueRenderTargetReadback(*Session, CaptureError, bCanUseReadPixelsFallback);
+		}
+
+		if (!bQueuedFrame)
 		{
 			if (!bCanUseReadPixelsFallback || !CaptureRenderTargetFrameFallback(*Session, CaptureError))
 			{
@@ -593,6 +659,179 @@ void URuntimeRecSubsystem::PollRenderTargetReadbacks(
 	}
 }
 
+void URuntimeRecSubsystem::PollRenderTargetGpuEncodes(
+	const FString& SessionId,
+	FRuntimeRecRecordingSession& Session,
+	TArray<FString>& SessionsToRemove)
+{
+	for (int32 RequestIndex = 0; RequestIndex < Session.PendingGpuEncodes.Num();)
+	{
+		TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> Request = Session.PendingGpuEncodes[RequestIndex];
+		if (!Request.IsValid() || Request->bCancelled)
+		{
+			Session.PendingGpuEncodes.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bSkipped || Request->bDone)
+		{
+			Session.PendingGpuEncodes.RemoveAt(RequestIndex);
+			continue;
+		}
+
+		if (Request->bHadError)
+		{
+			const FString GpuError = Request->Error.IsEmpty() ? TEXT("GPU render target encode failed.") : Request->Error;
+			FString FallbackError;
+			if (!FallbackRenderTargetSessionToReadback(Session, GpuError, FallbackError))
+			{
+				Session.LastError = FallbackError;
+				SetError(Session.LastError);
+				SessionsToRemove.AddUnique(SessionId);
+			}
+			return;
+		}
+
+		++RequestIndex;
+	}
+}
+
+bool URuntimeRecSubsystem::QueueRenderTargetGpuEncode(
+	FRuntimeRecRecordingSession& Session,
+	FString& OutError,
+	bool& bOutCanUseReadPixelsFallback)
+{
+	bOutCanUseReadPixelsFallback = false;
+
+	UTextureRenderTarget2D* RenderTarget = Session.SourceRenderTarget.Get();
+	if (!RenderTarget)
+	{
+		OutError = TEXT("RenderTarget is no longer valid.");
+		return false;
+	}
+
+	if (!Session.GpuEncoder.IsValid())
+	{
+		OutError = TEXT("GPU encoder is not available.");
+		return false;
+	}
+
+	FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+	if (!Resource)
+	{
+		OutError = TEXT("RenderTarget resource is not available.");
+		return false;
+	}
+
+	if (Session.PendingGpuEncodes.Num() >= RuntimeRecMaxPendingGpuEncodes)
+	{
+		if (!Session.ActiveOptions.bAllowFrameDrop)
+		{
+			OutError = TEXT("GPU encode queue is full.");
+			return false;
+		}
+
+		if (TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> DroppedRequest = Session.PendingGpuEncodes[0])
+		{
+			DroppedRequest->bCancelled = true;
+		}
+		Session.PendingGpuEncodes.RemoveAt(0);
+	}
+
+	TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe> Request = MakeShared<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>();
+	TSharedPtr<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe> GpuEncoder = Session.GpuEncoder;
+	const int64 FrameIndex = Session.NextCaptureFrameIndex++;
+
+	Session.PendingGpuEncodes.Add(Request);
+
+	ENQUEUE_RENDER_COMMAND(RuntimeRecQueueRenderTargetGpuEncode)(
+		[Request, GpuEncoder, Resource, FrameIndex](FRHICommandListImmediate& RHICmdList)
+		{
+			if (Request->bCancelled)
+			{
+				return;
+			}
+
+			if (!GpuEncoder.IsValid() || !GpuEncoder->IsStarted())
+			{
+				Request->bSkipped = true;
+				return;
+			}
+
+			const FTextureRHIRef SourceTexture = Resource->GetRenderTargetTexture();
+			if (!SourceTexture.IsValid())
+			{
+				Request->bSkipped = true;
+				return;
+			}
+
+			FString EncodeError;
+			if (!GpuEncoder->EncodeTexture_RenderThread(RHICmdList, SourceTexture, FrameIndex, EncodeError))
+			{
+				Request->Error = EncodeError;
+				Request->bHadError = true;
+				return;
+			}
+
+			Request->bDone = true;
+		});
+
+	return true;
+}
+
+bool URuntimeRecSubsystem::FallbackRenderTargetSessionToReadback(
+	FRuntimeRecRecordingSession& Session,
+	const FString& Reason,
+	FString& OutError)
+{
+	if (Session.Encoder)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>& Request : Session.PendingGpuEncodes)
+	{
+		if (Request.IsValid())
+		{
+			Request->bCancelled = true;
+		}
+	}
+	Session.PendingGpuEncodes.Reset();
+
+	if (Session.GpuEncoder.IsValid())
+	{
+		FlushRenderingCommands();
+
+		FString IgnoredGpuStopError;
+		Session.GpuEncoder->Stop(IgnoredGpuStopError);
+		Session.GpuEncoder.Reset();
+	}
+
+	if (!Session.CurrentOutputPath.IsEmpty() && IFileManager::Get().FileExists(*Session.CurrentOutputPath))
+	{
+		IFileManager::Get().Delete(*Session.CurrentOutputPath, false, true);
+	}
+
+	Session.Encoder = new FRuntimeRecVideoEncoder();
+	if (!Session.Encoder->Start(
+		Session.CurrentOutputPath,
+		Session.ActiveOptions.Width,
+		Session.ActiveOptions.Height,
+		Session.ActiveOptions.FPS,
+		Session.ActiveOptions.BitrateKbps,
+		Session.ActiveOptions.bPreferHardwareEncoder,
+		Session.ActiveOptions.bAllowFrameDrop,
+		OutError))
+	{
+		delete Session.Encoder;
+		Session.Encoder = nullptr;
+		return false;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: GPU encode failed; falling back to async readback. %s"), *Reason);
+	return true;
+}
+
 bool URuntimeRecSubsystem::QueueRenderTargetReadback(
 	FRuntimeRecRecordingSession& Session,
 	FString& OutError,
@@ -698,6 +937,12 @@ bool URuntimeRecSubsystem::CaptureRenderTargetFrameFallback(FRuntimeRecRecording
 	}
 
 	FString EncodeError;
+	if (!Session.Encoder)
+	{
+		OutError = TEXT("CPU encoder is not available for ReadPixels fallback.");
+		return false;
+	}
+
 	if (!Session.Encoder->EnqueueFrame(MoveTemp(Pixels), EncodeError))
 	{
 		OutError = EncodeError;
@@ -722,6 +967,22 @@ void URuntimeRecSubsystem::ClearRenderTargetSession(FRuntimeRecRecordingSession&
 		}
 	}
 	Session.PendingReadbacks.Reset();
+
+	for (const TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>& Request : Session.PendingGpuEncodes)
+	{
+		if (Request.IsValid())
+		{
+			Request->bCancelled = true;
+		}
+	}
+	Session.PendingGpuEncodes.Reset();
+
+	if (Session.GpuEncoder.IsValid())
+	{
+		FString IgnoredError;
+		Session.GpuEncoder->Stop(IgnoredError);
+		Session.GpuEncoder.Reset();
+	}
 
 	if (Session.Encoder)
 	{

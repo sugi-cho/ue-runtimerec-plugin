@@ -19,6 +19,12 @@ public class RuntimeRec : ModuleRules
 			new string[]
 			{
 				"ApplicationCore",
+				"AVCodecsCore",
+				"AVCodecsCoreRHI",
+				"D3D12RHI",
+				"NVCodecs",
+				"NVCodecsRHI",
+				"NVENC",
 				"Projects",
 				"RenderCore",
 				"RHI"
@@ -27,6 +33,8 @@ public class RuntimeRec : ModuleRules
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
+			AddEngineThirdPartyPrivateStaticDependencies(Target, "DX12");
+
 			PublicSystemLibraries.AddRange(
 				new string[]
 				{

@@ -8,6 +8,7 @@
 #include "RuntimeRecSubsystem.generated.h"
 
 class FRHIGPUTextureReadback;
+class FRuntimeRecGpuVideoEncoder;
 class FRuntimeRecVideoEncoder;
 class UTextureRenderTarget2D;
 
@@ -103,6 +104,15 @@ private:
 		FThreadSafeBool bCancelled = false;
 	};
 
+	struct FRuntimeRecGpuEncodeRequest
+	{
+		FString Error;
+		FThreadSafeBool bDone = false;
+		FThreadSafeBool bHadError = false;
+		FThreadSafeBool bSkipped = false;
+		FThreadSafeBool bCancelled = false;
+	};
+
 	struct FRuntimeRecRecordingSession
 	{
 		TWeakObjectPtr<UTextureRenderTarget2D> SourceRenderTarget;
@@ -113,7 +123,9 @@ private:
 		double FrameInterval = 1.0 / 30.0;
 		int64 NextCaptureFrameIndex = 0;
 		FRuntimeRecVideoEncoder* Encoder = nullptr;
+		TSharedPtr<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe> GpuEncoder;
 		TArray<TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe>> PendingReadbacks;
+		TArray<TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>> PendingGpuEncodes;
 	};
 
 	bool StartRenderTargetRecordingInternal(
@@ -132,6 +144,18 @@ private:
 		const FString& SessionId,
 		FRuntimeRecRecordingSession& Session,
 		TArray<FString>& SessionsToRemove);
+	void PollRenderTargetGpuEncodes(
+		const FString& SessionId,
+		FRuntimeRecRecordingSession& Session,
+		TArray<FString>& SessionsToRemove);
+	bool QueueRenderTargetGpuEncode(
+		FRuntimeRecRecordingSession& Session,
+		FString& OutError,
+		bool& bOutCanUseReadPixelsFallback);
+	bool FallbackRenderTargetSessionToReadback(
+		FRuntimeRecRecordingSession& Session,
+		const FString& Reason,
+		FString& OutError);
 	bool QueueRenderTargetReadback(
 		FRuntimeRecRecordingSession& Session,
 		FString& OutError,

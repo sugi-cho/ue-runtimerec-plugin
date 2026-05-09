@@ -66,6 +66,8 @@ void URuntimeRecSubsystem::Deinitialize()
 		StopRenderTargetRecordingInternal(SessionId, IgnoredPath, IgnoredError);
 	}
 
+	FRuntimeRecGpuVideoEncoder::ShutdownReusableStates();
+
 	Super::Deinitialize();
 }
 
@@ -461,19 +463,33 @@ bool URuntimeRecSubsystem::StopRenderTargetRecordingInternal(
 		return false;
 	}
 
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("RuntimeRec: StopRenderTargetRecordingInternal begin [Session=%s] Gpu=%d Cpu=%d PendingReadbacks=%d PendingGpuEncodes=%d"),
+		*SessionId,
+		Session->GpuEncoder.IsValid() ? 1 : 0,
+		Session->Encoder ? 1 : 0,
+		Session->PendingReadbacks.Num(),
+		Session->PendingGpuEncodes.Num());
+
 	if (Session->GpuEncoder.IsValid())
 	{
 		FlushRenderingCommands();
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec: Stopping GPU encoder [Session=%s]."), *SessionId);
 		if (!Session->GpuEncoder->Stop(OutError))
 		{
 			SetError(OutError);
 			return false;
 		}
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec: GPU encoder stopped [Session=%s]."), *SessionId);
 		Session->GpuEncoder.Reset();
+		FlushRenderingCommands();
 	}
 
 	if (Session->Encoder)
 	{
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec: Stopping CPU encoder [Session=%s]."), *SessionId);
 		if (!Session->Encoder->Stop(OutError))
 		{
 			SetError(OutError);
@@ -482,11 +498,13 @@ bool URuntimeRecSubsystem::StopRenderTargetRecordingInternal(
 
 		delete Session->Encoder;
 		Session->Encoder = nullptr;
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec: CPU encoder stopped [Session=%s]."), *SessionId);
 	}
 
 	OutSavedFilePath = Session->CurrentOutputPath;
 	ClearRenderTargetSession(*Session);
 	ActiveRenderTargetSessions.Remove(SessionId);
+	UE_LOG(LogTemp, Display, TEXT("RuntimeRec: StopRenderTargetRecordingInternal end [Session=%s]."), *SessionId);
 	return true;
 }
 
@@ -805,6 +823,7 @@ bool URuntimeRecSubsystem::FallbackRenderTargetSessionToReadback(
 		FString IgnoredGpuStopError;
 		Session.GpuEncoder->Stop(IgnoredGpuStopError);
 		Session.GpuEncoder.Reset();
+		FlushRenderingCommands();
 	}
 
 	if (!Session.CurrentOutputPath.IsEmpty() && IFileManager::Get().FileExists(*Session.CurrentOutputPath))
@@ -980,8 +999,10 @@ void URuntimeRecSubsystem::ClearRenderTargetSession(FRuntimeRecRecordingSession&
 	if (Session.GpuEncoder.IsValid())
 	{
 		FString IgnoredError;
+		FlushRenderingCommands();
 		Session.GpuEncoder->Stop(IgnoredError);
 		Session.GpuEncoder.Reset();
+		FlushRenderingCommands();
 	}
 
 	if (Session.Encoder)

@@ -13,6 +13,7 @@ public:
 
 	static bool IsAvailable(FString& OutReason);
 	static bool IsPreferred();
+	static void ShutdownReusableStates();
 
 	bool Start(
 		const FString& OutputPath,
@@ -32,10 +33,17 @@ public:
 	bool IsStarted() const { return bStarted; }
 
 private:
+	class FState;
+
 	bool InitializeWriter(FString& OutError);
 	bool WritePacket(const uint8* Data, uint64 DataSize, uint64 Timestamp, bool bIsKeyframe, FString& OutError);
-	bool DrainPackets(FString& OutError);
+	bool DrainPackets(FString& OutError, bool bWaitForAll = false);
+	bool RetireStateForReuse();
 	void ShutdownWriter();
+	static void DestroyStateResources(FState& InState);
+	static FCriticalSection& GetReusableStateCriticalSection();
+	static TArray<TUniquePtr<FState>>& GetReusableStates();
+	static TUniquePtr<FState> AcquireReusableState(int32 Width, int32 Height, int32 FPS, int32 BitrateKbps, int32 OutputSlotCount);
 
 private:
 	FString OutputPath;
@@ -48,6 +56,5 @@ private:
 	bool bReservedGpuEncoderSlot = false;
 	FCriticalSection CriticalSection;
 
-	class FState;
 	TUniquePtr<FState> State;
 };

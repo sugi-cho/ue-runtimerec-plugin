@@ -39,6 +39,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
 	bool StopRecording(TArray<FString>& OutSavedFilePaths, FString& OutError);
 
+	UFUNCTION(CallInEditor, Category = "UE_RuntimeRec|Editor", meta = (DisplayName = "Start Recording"))
+	void StartRecordingEditor();
+
+	UFUNCTION(CallInEditor, Category = "UE_RuntimeRec|Editor", meta = (DisplayName = "Stop Recording"))
+	void StopRecordingEditor();
+
 	UFUNCTION(BlueprintPure, Category = "UE_RuntimeRec")
 	bool IsRecording() const { return bRecording; }
 

@@ -36,6 +36,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
 	bool StopRecording(FString& OutSavedFilePath, FString& OutError);
 
+	UFUNCTION(CallInEditor, Category = "UE_RuntimeRec|Editor", meta = (DisplayName = "Start Recording"))
+	void StartRecordingEditor();
+
+	UFUNCTION(CallInEditor, Category = "UE_RuntimeRec|Editor", meta = (DisplayName = "Stop Recording"))
+	void StopRecordingEditor();
+
 	UFUNCTION(BlueprintCallable, Category = "UE_RuntimeRec")
 	UTextureRenderTarget2D* GetOrCreateRenderTarget();
 
@@ -57,6 +63,15 @@ public:
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	TObjectPtr<APawn> SourcePawn;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
+	bool bAutoAssignSourcePawnFromPlayerController = true;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Lumen")
+	bool bForceLumenForSceneCapture = true;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec|Lumen", meta = (ClampMin = "0.1", ClampMax = "1.0"))
+	float LumenSurfaceCacheResolution = 0.5f;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "UE_RuntimeRec")
 	TObjectPtr<UTextureRenderTarget2D> TargetRenderTarget;
@@ -111,11 +126,12 @@ private:
 	FString CurrentSessionId;
 	FString CurrentOutputPath;
 
-	UCameraComponent* ResolveSourceCameraComponent() const;
-	UCameraComponent* ResolvePawnCameraComponent() const;
-	void UpdateCaptureConfiguration();
+	UCameraComponent* ResolveSourceCameraComponent(bool bAllowPendingAutoSource) const;
+	UCameraComponent* ResolvePawnCameraComponent(bool bAllowPendingAutoSource) const;
+	void UpdateCaptureConfiguration(bool bAllowPendingAutoSource);
 	void ApplySourceCameraSettings(UCameraComponent* CameraComponent);
 	URuntimeRecSubsystem* ResolveRuntimeRecSubsystem() const;
+	APawn* ResolveAutoSourcePawn() const;
 	static int32 MakeEvenDimension(int32 Value);
 	void SetError(const FString& Error);
 };

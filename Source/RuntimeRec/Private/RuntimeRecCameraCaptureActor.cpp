@@ -9,6 +9,7 @@
 #include "Engine/TextureRenderTarget.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "RuntimeRecSubsystem.h"
 
 ARuntimeRecCameraCaptureActor::ARuntimeRecCameraCaptureActor()
@@ -31,13 +32,13 @@ ARuntimeRecCameraCaptureActor::ARuntimeRecCameraCaptureActor()
 void ARuntimeRecCameraCaptureActor::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
-	UpdateCaptureConfiguration();
+	UpdateCaptureConfiguration(true);
 }
 
 void ARuntimeRecCameraCaptureActor::BeginPlay()
 {
 	Super::BeginPlay();
-	UpdateCaptureConfiguration();
+	UpdateCaptureConfiguration(true);
 
 	if (bAutoStartRecording)
 	{
@@ -69,6 +70,11 @@ void ARuntimeRecCameraCaptureActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	if (bAutoAssignSourcePawnFromPlayerController && !SourcePawn)
+	{
+		UpdateCaptureConfiguration(true);
+	}
+
 	if (!bCaptureEveryTick && !bRecording)
 	{
 		return;
@@ -87,8 +93,8 @@ void ARuntimeRecCameraCaptureActor::Tick(float DeltaSeconds)
 
 bool ARuntimeRecCameraCaptureActor::RefreshCaptureConfiguration()
 {
-	UpdateCaptureConfiguration();
-	return ResolveSourceCameraComponent() != nullptr && GetEffectiveRenderTarget() != nullptr;
+	UpdateCaptureConfiguration(false);
+	return ResolveSourceCameraComponent(false) != nullptr && GetEffectiveRenderTarget() != nullptr;
 }
 
 bool ARuntimeRecCameraCaptureActor::StartRecording(FString& OutError)
@@ -143,6 +149,15 @@ bool ARuntimeRecCameraCaptureActor::StartRecording(FString& OutError)
 	return true;
 }
 
+void ARuntimeRecCameraCaptureActor::StartRecordingEditor()
+{
+	FString OutError;
+	if (!StartRecording(OutError) && !OutError.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s: %s"), *GetName(), *OutError);
+	}
+}
+
 bool ARuntimeRecCameraCaptureActor::StopRecording(FString& OutSavedFilePath, FString& OutError)
 {
 	if (!bRecording)
@@ -169,6 +184,16 @@ bool ARuntimeRecCameraCaptureActor::StopRecording(FString& OutSavedFilePath, FSt
 	CurrentOutputPath = OutSavedFilePath;
 	LastError.Reset();
 	return true;
+}
+
+void ARuntimeRecCameraCaptureActor::StopRecordingEditor()
+{
+	FString OutSavedFilePath;
+	FString OutError;
+	if (!StopRecording(OutSavedFilePath, OutError) && !OutError.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s: %s"), *GetName(), *OutError);
+	}
 }
 
 UTextureRenderTarget2D* ARuntimeRecCameraCaptureActor::GetOrCreateRenderTarget()
@@ -208,11 +233,11 @@ UTextureRenderTarget2D* ARuntimeRecCameraCaptureActor::GetEffectiveRenderTarget(
 	return GeneratedRenderTarget;
 }
 
-UCameraComponent* ARuntimeRecCameraCaptureActor::ResolveSourceCameraComponent() const
+UCameraComponent* ARuntimeRecCameraCaptureActor::ResolveSourceCameraComponent(bool bAllowPendingAutoSource) const
 {
 	if (!SourceCamera)
 	{
-		return ResolvePawnCameraComponent();
+		return ResolvePawnCameraComponent(bAllowPendingAutoSource);
 	}
 
 	if (UCameraComponent* CameraComponent = SourceCamera->GetCameraComponent())
@@ -220,20 +245,31 @@ UCameraComponent* ARuntimeRecCameraCaptureActor::ResolveSourceCameraComponent() 
 		return CameraComponent;
 	}
 
-	return ResolvePawnCameraComponent();
+	return ResolvePawnCameraComponent(bAllowPendingAutoSource);
 }
 
-UCameraComponent* ARuntimeRecCameraCaptureActor::ResolvePawnCameraComponent() const
+UCameraComponent* ARuntimeRecCameraCaptureActor::ResolvePawnCameraComponent(bool bAllowPendingAutoSource) const
 {
-	if (!SourcePawn)
+	if (SourcePawn)
+	{
+		return SourcePawn->FindComponentByClass<UCameraComponent>();
+	}
+
+	if (!bAutoAssignSourcePawnFromPlayerController)
 	{
 		return nullptr;
 	}
 
-	return SourcePawn->FindComponentByClass<UCameraComponent>();
+	if (APawn* AutoSourcePawn = ResolveAutoSourcePawn())
+	{
+		const_cast<ARuntimeRecCameraCaptureActor*>(this)->SourcePawn = AutoSourcePawn;
+		return AutoSourcePawn->FindComponentByClass<UCameraComponent>();
+	}
+
+	return nullptr;
 }
 
-void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration()
+void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration(bool bAllowPendingAutoSource)
 {
 	if (!SceneCaptureComponent)
 	{
@@ -255,15 +291,33 @@ void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration()
 	SceneCaptureComponent->CompositeMode = ESceneCaptureCompositeMode::SCCM_Overwrite;
 	SceneCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
 	SceneCaptureComponent->ShowFlags.SetPostProcessing(bIncludeCameraPostProcess);
+	SceneCaptureComponent->ShowFlags.SetLumenGlobalIllumination(true);
+	SceneCaptureComponent->ShowFlags.SetLumenReflections(true);
 
-	UCameraComponent* CameraComponent = ResolveSourceCameraComponent();
+	UCameraComponent* CameraComponent = ResolveSourceCameraComponent(bAllowPendingAutoSource);
 	if (!CameraComponent)
 	{
+		if (bAllowPendingAutoSource && bAutoAssignSourcePawnFromPlayerController)
+		{
+			return;
+		}
+
 		SetError(TEXT("Source camera is not set."));
 		return;
 	}
 
 	ApplySourceCameraSettings(CameraComponent);
+
+	if (bForceLumenForSceneCapture)
+	{
+		SceneCaptureComponent->PostProcessSettings.bOverride_DynamicGlobalIlluminationMethod = true;
+		SceneCaptureComponent->PostProcessSettings.DynamicGlobalIlluminationMethod = EDynamicGlobalIlluminationMethod::Lumen;
+		SceneCaptureComponent->PostProcessSettings.bOverride_ReflectionMethod = true;
+		SceneCaptureComponent->PostProcessSettings.ReflectionMethod = EReflectionMethod::Lumen;
+		SceneCaptureComponent->PostProcessSettings.bOverride_LumenSurfaceCacheResolution = true;
+		SceneCaptureComponent->PostProcessSettings.LumenSurfaceCacheResolution = LumenSurfaceCacheResolution;
+	}
+
 	LastError.Reset();
 }
 
@@ -295,6 +349,23 @@ void ARuntimeRecCameraCaptureActor::ApplySourceCameraSettings(UCameraComponent* 
 		SceneCaptureComponent->PostProcessSettings = FPostProcessSettings();
 		SceneCaptureComponent->PostProcessBlendWeight = 0.0f;
 	}
+}
+
+APawn* ARuntimeRecCameraCaptureActor::ResolveAutoSourcePawn() const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return nullptr;
+	}
+
+	APlayerController* PlayerController = World->GetFirstPlayerController();
+	if (!PlayerController)
+	{
+		return nullptr;
+	}
+
+	return PlayerController->GetPawn();
 }
 
 URuntimeRecSubsystem* ARuntimeRecCameraCaptureActor::ResolveRuntimeRecSubsystem() const

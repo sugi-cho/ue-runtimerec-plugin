@@ -153,6 +153,15 @@ Fail:
 	return false;
 }
 
+void ARuntimeRecRecordingGroupActor::StartRecordingEditor()
+{
+	FString OutError;
+	if (!StartRecording(OutError) && !OutError.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s: %s"), *GetName(), *OutError);
+	}
+}
+
 bool ARuntimeRecRecordingGroupActor::StopRecording(TArray<FString>& OutSavedFilePaths, FString& OutError)
 {
 	OutSavedFilePaths.Reset();
@@ -213,6 +222,16 @@ bool ARuntimeRecRecordingGroupActor::StopRecording(TArray<FString>& OutSavedFile
 	}
 
 	return true;
+}
+
+void ARuntimeRecRecordingGroupActor::StopRecordingEditor()
+{
+	TArray<FString> OutSavedFilePaths;
+	FString OutError;
+	if (!StopRecording(OutSavedFilePaths, OutError) && !OutError.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s: %s"), *GetName(), *OutError);
+	}
 }
 
 TArray<FString> ARuntimeRecRecordingGroupActor::GetCurrentOutputPaths() const

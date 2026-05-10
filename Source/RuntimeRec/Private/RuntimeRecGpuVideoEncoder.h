@@ -37,10 +37,12 @@ private:
 	class FState;
 
 	bool InitializeWriter(FString& OutError);
+	bool FinalizeWriter(FString& OutError);
+	bool SendEndOfStream(FString& OutError);
+	void DestroyActiveState(FString& OutError);
 	bool WritePacket(const uint8* Data, uint64 DataSize, uint64 Timestamp, bool bIsKeyframe, FString& OutError);
 	bool DrainPackets(FString& OutError, bool bWaitForAll = false);
 	bool RetireStateForReuse();
-	void ShutdownWriter();
 	static void DestroyStateResources(FState& InState);
 	static FCriticalSection& GetReusableStateCriticalSection();
 	static TArray<TUniquePtr<FState>>& GetReusableStates();
@@ -52,7 +54,8 @@ private:
 		int32 OutputSlotCount,
 		void* HardwareDeviceIdentity,
 		void* VideoContextIdentity,
-		void* D3D12DeviceIdentity);
+		void* D3D12DeviceIdentity,
+		int32 DeviceRemovedReason);
 
 private:
 	FString OutputPath;

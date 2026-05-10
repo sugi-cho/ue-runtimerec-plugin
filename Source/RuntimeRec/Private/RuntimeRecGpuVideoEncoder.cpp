@@ -122,6 +122,18 @@ namespace
 		OutError = FString::Printf(TEXT("%s failed: %s [%d]"), Context, *NvEncErrorToString(Encoder, Result), static_cast<int32>(Result));
 		return false;
 	}
+
+	void LogNvEncCallResult(const TCHAR* Context, void* Encoder, NVENCSTATUS Result)
+	{
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("%s [Encoder=%p] Result=%d (%s)"),
+			Context,
+			Encoder,
+			static_cast<int32>(Result),
+			*NvEncErrorToString(Encoder, Result));
+	}
 #endif
 }
 
@@ -157,6 +169,7 @@ public:
 	TRefCountPtr<ID3D12Device> D3D12Device;
 	TRefCountPtr<ID3D12Fence> InputFence;
 	TRefCountPtr<ID3D12Fence> OutputFence;
+	int32 DeviceRemovedReason = 0;
 	TStaticArray<FInputSlot, RuntimeRecGpuEncoderInputBufferCount> InputSlots;
 	TArray<FOutputSlot> OutputSlots;
 	TArray<int32> FreeOutputSlots;
@@ -173,6 +186,7 @@ public:
 	void* HardwareDeviceIdentity = nullptr;
 	void* VideoContextIdentity = nullptr;
 	void* D3D12DeviceIdentity = nullptr;
+	bool bForceNextFrameIdr = true;
 	NV_ENC_CONFIG EncodeConfig = {};
 	NV_ENC_INITIALIZE_PARAMS InitializeParams = {};
 
@@ -185,11 +199,55 @@ public:
 #if PLATFORM_WINDOWS
 void FRuntimeRecGpuVideoEncoder::DestroyStateResources(FState& InState)
 {
+	const int32 PendingPacketCount = InState.PendingPackets.Num();
+	int32 MappedPacketCount = 0;
+	for (const FState::FPendingPacket& PendingPacket : InState.PendingPackets)
+	{
+		if (PendingPacket.OutputMapResource.mappedResource)
+		{
+			++MappedPacketCount;
+		}
+	}
+
+	int32 RegisteredInputCount = 0;
+	for (const FState::FInputSlot& InputSlot : InState.InputSlots)
+	{
+		if (InputSlot.RegisteredResource)
+		{
+			++RegisteredInputCount;
+		}
+	}
+
+	int32 RegisteredOutputCount = 0;
+	for (const FState::FOutputSlot& OutputSlot : InState.OutputSlots)
+	{
+		if (OutputSlot.RegisteredResource)
+		{
+			++RegisteredOutputCount;
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("RuntimeRec GPU encoder destroy begin [State=%p] PendingPackets=%d MappedPackets=%d RegisteredInputs=%d RegisteredOutputs=%d FreeOutputSlots=%d OutputSlots=%d Encoder=%d SinkWriter=%d MfStarted=%d"),
+		&InState,
+		PendingPacketCount,
+		MappedPacketCount,
+		RegisteredInputCount,
+		RegisteredOutputCount,
+		InState.FreeOutputSlots.Num(),
+		InState.OutputSlots.Num(),
+		InState.Encoder ? 1 : 0,
+		InState.SinkWriter ? 1 : 0,
+		InState.bMfStarted ? 1 : 0);
+
 	for (FState::FPendingPacket& PendingPacket : InState.PendingPackets)
 	{
 		if (PendingPacket.OutputMapResource.mappedResource && InState.Encoder)
 		{
-			FAPI::Get<FNVENC>().nvEncUnmapInputResource(InState.Encoder, PendingPacket.OutputMapResource.mappedResource);
+			const NVENCSTATUS UnmapResult = FAPI::Get<FNVENC>().nvEncUnmapInputResource(InState.Encoder, PendingPacket.OutputMapResource.mappedResource);
+			LogNvEncCallResult(TEXT("RuntimeRec GPU encoder nvEncUnmapInputResource pending"), InState.Encoder, UnmapResult);
 			PendingPacket.OutputMapResource.mappedResource = nullptr;
 		}
 	}
@@ -203,7 +261,8 @@ void FRuntimeRecGpuVideoEncoder::DestroyStateResources(FState& InState)
 		{
 			if (InputSlot.RegisteredResource)
 			{
-				FAPI::Get<FNVENC>().nvEncUnregisterResource(InState.Encoder, InputSlot.RegisteredResource);
+				const NVENCSTATUS UnregisterResult = FAPI::Get<FNVENC>().nvEncUnregisterResource(InState.Encoder, InputSlot.RegisteredResource);
+				LogNvEncCallResult(TEXT("RuntimeRec GPU encoder nvEncUnregisterResource input"), InState.Encoder, UnregisterResult);
 				InputSlot.RegisteredResource = nullptr;
 			}
 		}
@@ -212,12 +271,14 @@ void FRuntimeRecGpuVideoEncoder::DestroyStateResources(FState& InState)
 		{
 			if (OutputSlot.RegisteredResource)
 			{
-				FAPI::Get<FNVENC>().nvEncUnregisterResource(InState.Encoder, OutputSlot.RegisteredResource);
+				const NVENCSTATUS UnregisterResult = FAPI::Get<FNVENC>().nvEncUnregisterResource(InState.Encoder, OutputSlot.RegisteredResource);
+				LogNvEncCallResult(TEXT("RuntimeRec GPU encoder nvEncUnregisterResource output"), InState.Encoder, UnregisterResult);
 				OutputSlot.RegisteredResource = nullptr;
 			}
 		}
 
-		FAPI::Get<FNVENC>().nvEncDestroyEncoder(InState.Encoder);
+		const NVENCSTATUS DestroyResult = FAPI::Get<FNVENC>().nvEncDestroyEncoder(InState.Encoder);
+		LogNvEncCallResult(TEXT("RuntimeRec GPU encoder nvEncDestroyEncoder"), InState.Encoder, DestroyResult);
 		InState.Encoder = nullptr;
 	}
 
@@ -233,18 +294,7 @@ void FRuntimeRecGpuVideoEncoder::DestroyStateResources(FState& InState)
 	}
 	InState.OutputSlots.Reset();
 
-	if (InState.SinkWriter)
-	{
-		InState.SinkWriter->Finalize();
-		InState.SinkWriter->Release();
-		InState.SinkWriter = nullptr;
-	}
-
-	if (InState.bMfStarted)
-	{
-		MFShutdown();
-		InState.bMfStarted = false;
-	}
+	UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder destroy end."));
 }
 #endif
 
@@ -278,7 +328,8 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 	int32 OutputSlotCount,
 	void* HardwareDeviceIdentity,
 	void* VideoContextIdentity,
-	void* D3D12DeviceIdentity)
+	void* D3D12DeviceIdentity,
+	int32 DeviceRemovedReason)
 {
 #if PLATFORM_WINDOWS
 	PruneReusableStates();
@@ -302,7 +353,8 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 			const bool bIdentityMatches =
 				Candidate->HardwareDeviceIdentity == HardwareDeviceIdentity &&
 				Candidate->VideoContextIdentity == VideoContextIdentity &&
-				Candidate->D3D12DeviceIdentity == D3D12DeviceIdentity;
+				Candidate->D3D12DeviceIdentity == D3D12DeviceIdentity &&
+				Candidate->DeviceRemovedReason == DeviceRemovedReason;
 
 			const bool bStateIsBroken =
 				!Candidate->Encoder ||
@@ -444,7 +496,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		const auto VideoContext = HardwareDevice->GetContext<FVideoContextD3D12>();
 		const FAVDevice* HardwareDevicePtr = &HardwareDevice.Get();
 		const FVideoContextD3D12* VideoContextPtr = VideoContext.Get();
-		const HRESULT DeviceRemovedReason = VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device->GetDeviceRemovedReason() : S_OK;
+		const int32 DeviceRemovedReason = static_cast<int32>(VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device->GetDeviceRemovedReason() : S_OK);
 		UE_LOG(
 			LogTemp,
 			Display,
@@ -477,6 +529,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	void* CurrentHardwareDeviceIdentity = const_cast<FAVDevice*>(HardwareDevicePtr);
 	void* CurrentVideoContextIdentity = const_cast<FVideoContextD3D12*>(VideoContextPtr);
 	void* CurrentD3D12DeviceIdentity = VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device.GetReference() : nullptr;
+	const int32 CurrentDeviceRemovedReason = static_cast<int32>(VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device->GetDeviceRemovedReason() : S_OK);
 
 	State = AcquireReusableState(
 		Width,
@@ -486,21 +539,31 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		OutputSlotCount,
 		CurrentHardwareDeviceIdentity,
 		CurrentVideoContextIdentity,
-		CurrentD3D12DeviceIdentity);
+		CurrentD3D12DeviceIdentity,
+		CurrentDeviceRemovedReason);
 	if (State.IsValid())
 	{
 		bReservedGpuEncoderSlot = true;
+		State->bForceNextFrameIdr = true;
 		State->FreeOutputSlots.Reset();
 		for (int32 SlotIndex = 0; SlotIndex < State->OutputSlots.Num(); ++SlotIndex)
 		{
 			State->FreeOutputSlots.Add(SlotIndex);
 		}
 
-		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reused idle NVENC session [Output=%s] Encoder=%p OutputSlots=%d"), *OutputPath, State->Encoder, State->OutputSlots.Num());
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("RuntimeRec GPU encoder reused idle NVENC session [Output=%s] Encoder=%p OutputSlots=%d Device=%p DeviceRemovedReason=%s"),
+			*OutputPath,
+			State->Encoder,
+			State->OutputSlots.Num(),
+			State->D3D12Device.GetReference(),
+			*HResultToString(static_cast<HRESULT>(State->DeviceRemovedReason)));
 		if (!InitializeWriter(OutError))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder writer initialization failed for reused session [Output=%s]: %s"), *OutputPath, *OutError);
-			ShutdownWriter();
+			DestroyActiveState(OutError);
 			State.Reset();
 			if (bReservedGpuEncoderSlot)
 			{
@@ -511,7 +574,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		}
 
 		bStarted = true;
-		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder start end [Output=%s] Encoder=%p Reused=1"), *OutputPath, State ? State->Encoder : nullptr);
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder start end [Output=%s] Encoder=%p Reused=1 Device=%p"), *OutputPath, State ? State->Encoder : nullptr, State ? State->D3D12Device.GetReference() : nullptr);
 		return true;
 	}
 #endif
@@ -532,11 +595,12 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	State->VideoContextIdentity = CurrentVideoContextIdentity;
 	State->D3D12DeviceIdentity = CurrentD3D12DeviceIdentity;
 	State->D3D12Device = VideoContext->Device;
+	State->DeviceRemovedReason = CurrentDeviceRemovedReason;
 	if (!State->D3D12Device.IsValid())
 	{
 		OutError = TEXT("D3D12 device is not available for Direct NVENC.");
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder start failed: D3D12 device unavailable [Output=%s]."), *OutputPath);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -603,7 +667,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	{
 		OutError = OpenSessionError;
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder open session failed [Output=%s]: %s"), *OutputPath, *OutError);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -667,7 +731,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	if (!CheckNvEnc(FAPI::Get<FNVENC>().nvEncInitializeEncoder(State->Encoder, &State->InitializeParams), State->Encoder, TEXT("nvEncInitializeEncoder"), OutError))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder initialize failed [Output=%s]: %s"), *OutputPath, *OutError);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -680,7 +744,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	if (!CheckHr(State->D3D12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(State->InputFence.GetInitReference())), TEXT("ID3D12Device::CreateFence input"), OutError))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder input fence creation failed [Output=%s]: %s"), *OutputPath, *OutError);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -693,7 +757,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	if (!CheckHr(State->D3D12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(State->OutputFence.GetInitReference())), TEXT("ID3D12Device::CreateFence output"), OutError))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder output fence creation failed [Output=%s]: %s"), *OutputPath, *OutError);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -735,7 +799,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 			OutError))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder output slot resource creation failed [Output=%s] Slot=%d: %s"), *OutputPath, SlotIndex, *OutError);
-			ShutdownWriter();
+			DestroyActiveState(OutError);
 			State.Reset();
 			if (bReservedGpuEncoderSlot)
 			{
@@ -757,7 +821,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		if (!CheckNvEnc(FAPI::Get<FNVENC>().nvEncRegisterResource(State->Encoder, &OutputRegisterResource), State->Encoder, TEXT("nvEncRegisterResource output"), OutError))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder output slot registration failed [Output=%s] Slot=%d: %s"), *OutputPath, SlotIndex, *OutError);
-			ShutdownWriter();
+			DestroyActiveState(OutError);
 			State.Reset();
 			if (bReservedGpuEncoderSlot)
 			{
@@ -780,7 +844,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	if (!InitializeWriter(OutError))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder writer initialization failed [Output=%s]: %s"), *OutputPath, *OutError);
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
 		{
@@ -791,7 +855,7 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	}
 
 	bStarted = true;
-	UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder start end [Output=%s] Encoder=%p"), *OutputPath, State ? State->Encoder : nullptr);
+	UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder start end [Output=%s] Encoder=%p Reused=0 Device=%p"), *OutputPath, State ? State->Encoder : nullptr, State ? State->D3D12Device.GetReference() : nullptr);
 	return true;
 }
 
@@ -960,34 +1024,39 @@ bool FRuntimeRecGpuVideoEncoder::EncodeTexture_RenderThread(
 		return false;
 	}
 
-	NV_ENC_INPUT_RESOURCE_D3D12 InputResource = {};
-	InputResource.inputFencePoint.bWait = true;
-	InputResource.inputFencePoint.pFence = State->InputFence.GetReference();
-	InputResource.inputFencePoint.waitValue = InputFenceValue;
-	InputResource.pInputBuffer = InputMapResource.mappedResource;
+		NV_ENC_INPUT_RESOURCE_D3D12 InputResource = {};
+		InputResource.version = NV_ENC_INPUT_RESOURCE_D3D12_VER;
+		InputResource.inputFencePoint.version = NV_ENC_FENCE_POINT_D3D12_VER;
+		InputResource.inputFencePoint.bWait = true;
+		InputResource.inputFencePoint.pFence = State->InputFence.GetReference();
+		InputResource.inputFencePoint.waitValue = InputFenceValue;
+		InputResource.pInputBuffer = InputMapResource.mappedResource;
 
-	++State->OutputFenceValue;
-	NV_ENC_OUTPUT_RESOURCE_D3D12 OutputResource = {};
-	OutputResource.outputFencePoint.bSignal = true;
-	OutputResource.outputFencePoint.pFence = State->OutputFence.GetReference();
-	OutputResource.outputFencePoint.signalValue = State->OutputFenceValue;
-	OutputResource.pOutputBuffer = OutputMapResource.mappedResource;
+		++State->OutputFenceValue;
+		NV_ENC_OUTPUT_RESOURCE_D3D12 OutputResource = {};
+		OutputResource.version = NV_ENC_OUTPUT_RESOURCE_D3D12_VER;
+		OutputResource.outputFencePoint.version = NV_ENC_FENCE_POINT_D3D12_VER;
+		OutputResource.outputFencePoint.bSignal = true;
+		OutputResource.outputFencePoint.pFence = State->OutputFence.GetReference();
+		OutputResource.outputFencePoint.signalValue = State->OutputFenceValue;
+		OutputResource.pOutputBuffer = OutputMapResource.mappedResource;
 
 	NV_ENC_STRUCT(NV_ENC_PIC_PARAMS, Picture);
 	Picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
 	Picture.inputTimeStamp = static_cast<uint32>(FrameIndex);
 	Picture.inputBuffer = &InputResource;
 	Picture.bufferFmt = InputMapResource.mappedBufferFmt;
-	Picture.inputWidth = static_cast<uint32>(Width);
-	Picture.inputHeight = static_cast<uint32>(Height);
-	Picture.outputBitstream = &OutputResource;
-	if (FrameIndex == 0)
-	{
-		Picture.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
-	}
+		Picture.inputWidth = static_cast<uint32>(Width);
+		Picture.inputHeight = static_cast<uint32>(Height);
+		Picture.outputBitstream = &OutputResource;
+		if (FrameIndex == 0 || State->bForceNextFrameIdr)
+		{
+			Picture.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+			Picture.encodePicFlags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+		}
 
-	if (!CheckNvEnc(FAPI::Get<FNVENC>().nvEncEncodePicture(State->Encoder, &Picture), State->Encoder, TEXT("nvEncEncodePicture"), OutError))
-	{
+		if (!CheckNvEnc(FAPI::Get<FNVENC>().nvEncEncodePicture(State->Encoder, &Picture), State->Encoder, TEXT("nvEncEncodePicture"), OutError))
+		{
 		FAPI::Get<FNVENC>().nvEncUnmapInputResource(State->Encoder, OutputMapResource.mappedResource);
 		FAPI::Get<FNVENC>().nvEncUnmapInputResource(State->Encoder, InputMapResource.mappedResource);
 		State->FreeOutputSlots.Add(OutputSlotIndex);
@@ -1004,15 +1073,16 @@ bool FRuntimeRecGpuVideoEncoder::EncodeTexture_RenderThread(
 	FState::FPendingPacket PendingPacket;
 	PendingPacket.OutputSlotIndex = OutputSlotIndex;
 	PendingPacket.OutputResource = OutputResource;
-	PendingPacket.OutputMapResource = OutputMapResource;
-	PendingPacket.Timestamp = static_cast<uint64>(FrameIndex);
-	PendingPacket.bIsKeyframe = (FrameIndex == 0);
-	PendingPacket.OutputFenceValue = State->OutputFenceValue;
-	OutputMapResource.mappedResource = nullptr;
-	State->PendingPackets.Add(MoveTemp(PendingPacket));
+		PendingPacket.OutputMapResource = OutputMapResource;
+		PendingPacket.Timestamp = static_cast<uint64>(FrameIndex);
+		PendingPacket.bIsKeyframe = (FrameIndex == 0 || State->bForceNextFrameIdr);
+		PendingPacket.OutputFenceValue = State->OutputFenceValue;
+		OutputMapResource.mappedResource = nullptr;
+		State->PendingPackets.Add(MoveTemp(PendingPacket));
+		State->bForceNextFrameIdr = false;
 
-	return true;
-}
+		return true;
+	}
 
 bool FRuntimeRecGpuVideoEncoder::Stop(FString& OutError)
 {
@@ -1037,7 +1107,7 @@ bool FRuntimeRecGpuVideoEncoder::Stop(FString& OutError)
 		if (!DrainPackets(OutError, true))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder stop drain failed [Output=%s]: %s"), *OutputPath, *OutError);
-			ShutdownWriter();
+			DestroyActiveState(OutError);
 			bStarted = false;
 			if (bReservedGpuEncoderSlot)
 			{
@@ -1046,6 +1116,39 @@ bool FRuntimeRecGpuVideoEncoder::Stop(FString& OutError)
 			}
 			return false;
 		}
+
+		if (!SendEndOfStream(OutError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder stop EOS failed [Output=%s]: %s"), *OutputPath, *OutError);
+			DestroyActiveState(OutError);
+			bStarted = false;
+			if (bReservedGpuEncoderSlot)
+			{
+				ReleaseGpuEncoderSlot();
+				bReservedGpuEncoderSlot = false;
+			}
+			return false;
+		}
+
+		if (!DrainPackets(OutError, true))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder stop final drain failed [Output=%s]: %s"), *OutputPath, *OutError);
+			DestroyActiveState(OutError);
+			bStarted = false;
+			if (bReservedGpuEncoderSlot)
+			{
+				ReleaseGpuEncoderSlot();
+				bReservedGpuEncoderSlot = false;
+			}
+			return false;
+		}
+
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("RuntimeRec GPU encoder stop drain complete [Output=%s] PendingPackets=%d"),
+			*OutputPath,
+			State ? State->PendingPackets.Num() : -1);
 	}
 
 	bStarted = false;
@@ -1056,7 +1159,7 @@ bool FRuntimeRecGpuVideoEncoder::Stop(FString& OutError)
 	}
 	else
 	{
-		ShutdownWriter();
+		DestroyActiveState(OutError);
 		if (bReservedGpuEncoderSlot)
 		{
 			ReleaseGpuEncoderSlot();
@@ -1318,17 +1421,13 @@ bool FRuntimeRecGpuVideoEncoder::RetireStateForReuse()
 		State->FreeOutputSlots.Add(SlotIndex);
 	}
 
-	if (State->SinkWriter)
 	{
-		State->SinkWriter->Finalize();
-		State->SinkWriter->Release();
-		State->SinkWriter = nullptr;
-	}
-
-	if (State->bMfStarted)
-	{
-		MFShutdown();
-		State->bMfStarted = false;
+		FString FinalizeError;
+		if (!FinalizeWriter(FinalizeError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder retire finalize failed [Output=%s]: %s"), *OutputPath, *FinalizeError);
+			return false;
+		}
 	}
 
 	State->IdleSinceSeconds = FPlatformTime::Seconds();
@@ -1420,8 +1519,8 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 			if (ReusableState.IsValid())
 			{
 				DestroyStateResources(*ReusableState);
-				ReleaseGpuEncoderSlot();
 			}
+			ReleaseGpuEncoderSlot();
 		}
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool prune end."));
 	}
@@ -1446,33 +1545,99 @@ void FRuntimeRecGpuVideoEncoder::ShutdownReusableStates()
 			if (ReusableState.IsValid())
 			{
 				DestroyStateResources(*ReusableState);
-				ReleaseGpuEncoderSlot();
 			}
+			ReleaseGpuEncoderSlot();
 		}
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool shutdown end."));
 	}
 #endif
 }
 
-void FRuntimeRecGpuVideoEncoder::ShutdownWriter()
+bool FRuntimeRecGpuVideoEncoder::FinalizeWriter(FString& OutError)
 {
 #if PLATFORM_WINDOWS
-	if (State)
+	if (!State)
 	{
+		return true;
+	}
+
+	bool bFinalizeSucceeded = true;
+	if (State->SinkWriter)
+	{
+		const HRESULT FinalizeResult = State->SinkWriter->Finalize();
 		UE_LOG(
 			LogTemp,
 			Display,
-			TEXT("RuntimeRec GPU encoder shutdown begin [Output=%s] PendingPackets=%d FreeOutputSlots=%d OutputSlots=%d Encoder=%d SinkWriter=%d MfStarted=%d"),
-			*OutputPath,
-			State->PendingPackets.Num(),
-			State->FreeOutputSlots.Num(),
-			State->OutputSlots.Num(),
-			State->Encoder ? 1 : 0,
-			State->SinkWriter ? 1 : 0,
-			State->bMfStarted ? 1 : 0);
-		DestroyStateResources(*State);
-		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder shutdown end [Output=%s]."), *OutputPath);
+			TEXT("RuntimeRec GPU encoder sink writer finalize returned %s [Output=%s]."),
+			*HResultToString(FinalizeResult),
+			*OutputPath);
+
+		if (!CheckHr(FinalizeResult, TEXT("IMFSinkWriter::Finalize"), OutError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder sink writer finalize failed [Output=%s]: %s"), *OutputPath, *OutError);
+			bFinalizeSucceeded = false;
+		}
 	}
+
+	if (State->SinkWriter)
+	{
+		State->SinkWriter->Release();
+		State->SinkWriter = nullptr;
+	}
+
+	if (State->bMfStarted)
+	{
+		MFShutdown();
+		State->bMfStarted = false;
+	}
+
+	return bFinalizeSucceeded;
 #else
+	return true;
+#endif
+}
+
+bool FRuntimeRecGpuVideoEncoder::SendEndOfStream(FString& OutError)
+{
+#if PLATFORM_WINDOWS
+	if (!State || !State->Encoder)
+	{
+		return true;
+	}
+
+	NV_ENC_STRUCT(NV_ENC_PIC_PARAMS, EosPicture);
+	EosPicture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+	EosPicture.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+
+	const NVENCSTATUS Result = FAPI::Get<FNVENC>().nvEncEncodePicture(State->Encoder, &EosPicture);
+	LogNvEncCallResult(TEXT("RuntimeRec GPU encoder EOS encode"), State->Encoder, Result);
+	return CheckNvEnc(Result, State->Encoder, TEXT("nvEncEncodePicture EOS"), OutError);
+#else
+	return true;
+#endif
+}
+
+void FRuntimeRecGpuVideoEncoder::DestroyActiveState(FString& OutError)
+{
+#if PLATFORM_WINDOWS
+	(void)OutError;
+	if (!State)
+	{
+		return;
+	}
+
+	if (State->SinkWriter || State->bMfStarted)
+	{
+		FString FinalizeError;
+		FinalizeWriter(FinalizeError);
+		if (!FinalizeError.IsEmpty())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder writer finalize during destroy reported [Output=%s]: %s"), *OutputPath, *FinalizeError);
+		}
+	}
+
+	DestroyStateResources(*State);
+#else
+	(void)OutError;
 #endif
 }

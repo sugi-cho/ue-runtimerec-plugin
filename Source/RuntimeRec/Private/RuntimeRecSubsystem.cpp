@@ -66,8 +66,6 @@ void URuntimeRecSubsystem::Deinitialize()
 		StopRenderTargetRecordingInternal(SessionId, IgnoredPath, IgnoredError);
 	}
 
-	FRuntimeRecGpuVideoEncoder::ShutdownReusableStates();
-
 	Super::Deinitialize();
 }
 

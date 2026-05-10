@@ -44,6 +44,16 @@ namespace
 		4,
 		TEXT("Maximum number of Direct NVENC output packets to keep pending before draining."));
 
+	TAutoConsoleVariable<float> CVarRuntimeRecGpuVideoEncoderReusableIdleSeconds(
+		TEXT("RuntimeRec.RenderTarget.GpuVideoEncoderReusableIdleSeconds"),
+		30.0f,
+		TEXT("How long idle reusable NVENC sessions may stay in the pool before being pruned. Set to 0 or below to disable reuse retention."));
+
+	TAutoConsoleVariable<int32> CVarRuntimeRecMaxReusableGpuVideoEncoders(
+		TEXT("RuntimeRec.RenderTarget.MaxReusableGpuVideoEncoders"),
+		8,
+		TEXT("Maximum number of idle reusable NVENC sessions to keep in the pool. Oldest idle sessions are pruned first."));
+
 	FCriticalSection GpuEncoderSlotCriticalSection;
 	int32 ActiveGpuEncoderSlots = 0;
 	constexpr int32 RuntimeRecGpuEncoderInputBufferCount = 3;
@@ -153,12 +163,16 @@ public:
 	TArray<FPendingPacket> PendingPackets;
 	int64 InputFenceValue = 0;
 	int64 OutputFenceValue = 0;
+	double IdleSinceSeconds = 0.0;
 
 	void* Encoder = nullptr;
 	int32 ReuseWidth = 0;
 	int32 ReuseHeight = 0;
 	int32 ReuseFPS = 0;
 	int32 ReuseBitrateKbps = 0;
+	void* HardwareDeviceIdentity = nullptr;
+	void* VideoContextIdentity = nullptr;
+	void* D3D12DeviceIdentity = nullptr;
 	NV_ENC_CONFIG EncodeConfig = {};
 	NV_ENC_INITIALIZE_PARAMS InitializeParams = {};
 
@@ -261,35 +275,75 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 	int32 InHeight,
 	int32 InFPS,
 	int32 InBitrateKbps,
-	int32 OutputSlotCount)
+	int32 OutputSlotCount,
+	void* HardwareDeviceIdentity,
+	void* VideoContextIdentity,
+	void* D3D12DeviceIdentity)
 {
 #if PLATFORM_WINDOWS
-	FScopeLock Lock(&GetReusableStateCriticalSection());
-	TArray<TUniquePtr<FState>>& ReusableStates = GetReusableStates();
-	for (int32 StateIndex = 0; StateIndex < ReusableStates.Num(); ++StateIndex)
+	PruneReusableStates();
+
+	TUniquePtr<FState> ReusedState;
+	TArray<TUniquePtr<FState>> StaleStatesToDestroy;
+
 	{
-		const TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
-		if (!Candidate.IsValid() ||
-			!Candidate->Encoder ||
-			Candidate->SinkWriter ||
-			Candidate->bMfStarted ||
-			Candidate->PendingPackets.Num() > 0 ||
-			Candidate->ReuseWidth != InWidth ||
-			Candidate->ReuseHeight != InHeight ||
-			Candidate->ReuseFPS != InFPS ||
-			Candidate->ReuseBitrateKbps != InBitrateKbps ||
-			Candidate->OutputSlots.Num() != OutputSlotCount)
+		FScopeLock Lock(&GetReusableStateCriticalSection());
+		TArray<TUniquePtr<FState>>& ReusableStates = GetReusableStates();
+		for (int32 StateIndex = 0; StateIndex < ReusableStates.Num();)
 		{
-			continue;
+			const TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
+			if (!Candidate.IsValid())
+			{
+				ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
+				ReleaseGpuEncoderSlot();
+				continue;
+			}
+
+			const bool bIdentityMatches =
+				Candidate->HardwareDeviceIdentity == HardwareDeviceIdentity &&
+				Candidate->VideoContextIdentity == VideoContextIdentity &&
+				Candidate->D3D12DeviceIdentity == D3D12DeviceIdentity;
+
+			const bool bStateIsBroken =
+				!Candidate->Encoder ||
+				Candidate->SinkWriter ||
+				Candidate->bMfStarted ||
+				Candidate->PendingPackets.Num() > 0;
+
+			if (bStateIsBroken || !bIdentityMatches)
+			{
+				StaleStatesToDestroy.Add(MoveTemp(ReusableStates[StateIndex]));
+				ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
+				continue;
+			}
+
+			if (Candidate->ReuseWidth != InWidth ||
+				Candidate->ReuseHeight != InHeight ||
+				Candidate->ReuseFPS != InFPS ||
+				Candidate->ReuseBitrateKbps != InBitrateKbps ||
+				Candidate->OutputSlots.Num() != OutputSlotCount)
+			{
+				++StateIndex;
+				continue;
+			}
+
+			ReusedState = MoveTemp(ReusableStates[StateIndex]);
+			ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
+			break;
 		}
-
-		TUniquePtr<FState> ReusedState = MoveTemp(ReusableStates[StateIndex]);
-		ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
-		return ReusedState;
 	}
-#endif
 
-	return nullptr;
+	for (TUniquePtr<FState>& StaleState : StaleStatesToDestroy)
+	{
+		if (StaleState.IsValid())
+		{
+			DestroyStateResources(*StaleState);
+			ReleaseGpuEncoderSlot();
+		}
+	}
+
+	return ReusedState;
+#endif
 }
 
 bool FRuntimeRecGpuVideoEncoder::IsPreferred()
@@ -384,6 +438,28 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		return false;
 	}
 
+#if PLATFORM_WINDOWS
+	{
+		auto HardwareDevice = FAVDevice::GetHardwareDevice();
+		const auto VideoContext = HardwareDevice->GetContext<FVideoContextD3D12>();
+		const FAVDevice* HardwareDevicePtr = &HardwareDevice.Get();
+		const FVideoContextD3D12* VideoContextPtr = VideoContext.Get();
+		const HRESULT DeviceRemovedReason = VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device->GetDeviceRemovedReason() : S_OK;
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("RuntimeRec GPU encoder availability snapshot [Output=%s] RHI=%d GDynamicRHI=%p HardwareDevice=%p HasD3D12Context=%d VideoContext=%p NVENCValid=%d DeviceRemovedReason=%s"),
+			*InOutputPath,
+			GDynamicRHI ? static_cast<int32>(GDynamicRHI->GetInterfaceType()) : -1,
+			GDynamicRHI,
+			HardwareDevicePtr,
+			VideoContext.IsValid() ? 1 : 0,
+			VideoContextPtr,
+			FAPI::Get<FNVENC>().IsValid() ? 1 : 0,
+			*HResultToString(DeviceRemovedReason));
+	}
+#endif
+
 	OutputPath = InOutputPath;
 	Width = InWidth;
 	Height = InHeight;
@@ -394,7 +470,23 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	const int32 OutputSlotCount = FMath::Max(1, CVarRuntimeRecGpuVideoEncoderPendingPacketCount.GetValueOnAnyThread());
 
 #if PLATFORM_WINDOWS
-	State = AcquireReusableState(Width, Height, FPS, BitrateKbps, OutputSlotCount);
+	auto HardwareDevice = FAVDevice::GetHardwareDevice();
+	const auto VideoContext = HardwareDevice->GetContext<FVideoContextD3D12>();
+	const FAVDevice* HardwareDevicePtr = &HardwareDevice.Get();
+	const FVideoContextD3D12* VideoContextPtr = VideoContext.Get();
+	void* CurrentHardwareDeviceIdentity = const_cast<FAVDevice*>(HardwareDevicePtr);
+	void* CurrentVideoContextIdentity = const_cast<FVideoContextD3D12*>(VideoContextPtr);
+	void* CurrentD3D12DeviceIdentity = VideoContext.IsValid() && VideoContext->Device ? VideoContext->Device.GetReference() : nullptr;
+
+	State = AcquireReusableState(
+		Width,
+		Height,
+		FPS,
+		BitrateKbps,
+		OutputSlotCount,
+		CurrentHardwareDeviceIdentity,
+		CurrentVideoContextIdentity,
+		CurrentD3D12DeviceIdentity);
 	if (State.IsValid())
 	{
 		bReservedGpuEncoderSlot = true;
@@ -436,7 +528,10 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	State = MakeUnique<FState>();
 
 #if PLATFORM_WINDOWS
-	State->D3D12Device = FAVDevice::GetHardwareDevice()->GetContext<FVideoContextD3D12>()->Device;
+	State->HardwareDeviceIdentity = CurrentHardwareDeviceIdentity;
+	State->VideoContextIdentity = CurrentVideoContextIdentity;
+	State->D3D12DeviceIdentity = CurrentD3D12DeviceIdentity;
+	State->D3D12Device = VideoContext->Device;
 	if (!State->D3D12Device.IsValid())
 	{
 		OutError = TEXT("D3D12 device is not available for Direct NVENC.");
@@ -451,10 +546,30 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		return false;
 	}
 
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("RuntimeRec GPU encoder D3D12 device acquired [Output=%s] HardwareDevice=%p VideoContext=%p Device=%p DeviceRemovedReason=%s"),
+		*OutputPath,
+		&FAVDevice::GetHardwareDevice().Get(),
+		FAVDevice::GetHardwareDevice()->GetContext<FVideoContextD3D12>().Get(),
+		State->D3D12Device.GetReference(),
+		*HResultToString(State->D3D12Device->GetDeviceRemovedReason()));
+
 	NV_ENC_STRUCT(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, SessionParams);
 	SessionParams.apiVersion = NVENCAPI_VERSION;
 	SessionParams.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
 	SessionParams.device = State->D3D12Device.GetReference();
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("RuntimeRec GPU encoder NVENC open params [Output=%s] StructSize=%d ApiVersion=0x%08X NVENCAPI_VERSION=0x%08X DeviceType=%d Device=%p"),
+		*OutputPath,
+		static_cast<int32>(sizeof(SessionParams)),
+		static_cast<uint32>(SessionParams.apiVersion),
+		static_cast<uint32>(NVENCAPI_VERSION),
+		static_cast<int32>(SessionParams.deviceType),
+		SessionParams.device);
 	UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder opening NVENC session [Output=%s] Device=%p"), *OutputPath, State->D3D12Device.GetReference());
 
 	void* OpenedEncoder = nullptr;
@@ -1179,6 +1294,13 @@ bool FRuntimeRecGpuVideoEncoder::RetireStateForReuse()
 		return false;
 	}
 
+	const float ReusableIdleSeconds = CVarRuntimeRecGpuVideoEncoderReusableIdleSeconds.GetValueOnAnyThread();
+	const int32 MaxReusableGpuEncoders = FMath::Max(0, CVarRuntimeRecMaxReusableGpuVideoEncoders.GetValueOnAnyThread());
+	if (ReusableIdleSeconds <= 0.0f || MaxReusableGpuEncoders <= 0)
+	{
+		return false;
+	}
+
 	UE_LOG(
 		LogTemp,
 		Display,
@@ -1209,6 +1331,8 @@ bool FRuntimeRecGpuVideoEncoder::RetireStateForReuse()
 		State->bMfStarted = false;
 	}
 
+	State->IdleSinceSeconds = FPlatformTime::Seconds();
+
 	{
 		FScopeLock Lock(&GetReusableStateCriticalSection());
 		GetReusableStates().Add(MoveTemp(State));
@@ -1218,6 +1342,89 @@ bool FRuntimeRecGpuVideoEncoder::RetireStateForReuse()
 	return true;
 #else
 	return false;
+#endif
+}
+
+void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
+{
+#if PLATFORM_WINDOWS
+	TArray<TUniquePtr<FState>> StatesToDestroy;
+	const float ReusableIdleSeconds = CVarRuntimeRecGpuVideoEncoderReusableIdleSeconds.GetValueOnAnyThread();
+	const int32 MaxReusableGpuEncoders = FMath::Max(0, CVarRuntimeRecMaxReusableGpuVideoEncoders.GetValueOnAnyThread());
+	const bool bDisableReuseRetention = ReusableIdleSeconds <= 0.0f || MaxReusableGpuEncoders <= 0;
+	const double NowSeconds = FPlatformTime::Seconds();
+
+	{
+		FScopeLock Lock(&GetReusableStateCriticalSection());
+		TArray<TUniquePtr<FState>>& ReusableStates = GetReusableStates();
+
+		if (ReusableStates.IsEmpty())
+		{
+			return;
+		}
+
+		if (bDisableReuseRetention)
+		{
+			StatesToDestroy = MoveTemp(ReusableStates);
+		}
+		else
+		{
+			for (int32 StateIndex = ReusableStates.Num() - 1; StateIndex >= 0; --StateIndex)
+			{
+				const TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
+				const bool bExpired = !Candidate.IsValid() || (NowSeconds - Candidate->IdleSinceSeconds) >= static_cast<double>(ReusableIdleSeconds);
+				if (bExpired)
+				{
+					StatesToDestroy.Add(MoveTemp(ReusableStates[StateIndex]));
+					ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
+				}
+			}
+
+			while (ReusableStates.Num() > MaxReusableGpuEncoders)
+			{
+				int32 OldestIndex = INDEX_NONE;
+				double OldestIdleSinceSeconds = MAX_dbl;
+				for (int32 StateIndex = 0; StateIndex < ReusableStates.Num(); ++StateIndex)
+				{
+					const TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
+					if (!Candidate.IsValid())
+					{
+						OldestIndex = StateIndex;
+						break;
+					}
+
+					if (Candidate->IdleSinceSeconds < OldestIdleSinceSeconds)
+					{
+						OldestIdleSinceSeconds = Candidate->IdleSinceSeconds;
+						OldestIndex = StateIndex;
+					}
+				}
+
+				if (OldestIndex == INDEX_NONE)
+				{
+					break;
+				}
+
+				StatesToDestroy.Add(MoveTemp(ReusableStates[OldestIndex]));
+				ReusableStates.RemoveAtSwap(OldestIndex, 1, EAllowShrinking::No);
+			}
+		}
+	}
+
+	if (StatesToDestroy.Num() > 0)
+	{
+		const int32 PrunedCount = StatesToDestroy.Num();
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool prune begin [Count=%d]."), PrunedCount);
+		for (TUniquePtr<FState>& ReusableState : StatesToDestroy)
+		{
+			if (ReusableState.IsValid())
+			{
+				DestroyStateResources(*ReusableState);
+				ReleaseGpuEncoderSlot();
+			}
+		}
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool prune end."));
+	}
 #endif
 }
 
@@ -1232,20 +1439,16 @@ void FRuntimeRecGpuVideoEncoder::ShutdownReusableStates()
 
 	if (StatesToDestroy.Num() > 0)
 	{
-		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool shutdown begin [Count=%d]."), StatesToDestroy.Num());
-	}
-
-	for (TUniquePtr<FState>& ReusableState : StatesToDestroy)
-	{
-		if (ReusableState.IsValid())
+		const int32 ShutdownCount = StatesToDestroy.Num();
+		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool shutdown begin [Count=%d]."), ShutdownCount);
+		for (TUniquePtr<FState>& ReusableState : StatesToDestroy)
 		{
-			DestroyStateResources(*ReusableState);
-			ReleaseGpuEncoderSlot();
+			if (ReusableState.IsValid())
+			{
+				DestroyStateResources(*ReusableState);
+				ReleaseGpuEncoderSlot();
+			}
 		}
-	}
-
-	if (StatesToDestroy.Num() > 0)
-	{
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool shutdown end."));
 	}
 #endif

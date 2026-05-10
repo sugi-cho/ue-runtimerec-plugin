@@ -14,6 +14,7 @@ public:
 	static bool IsAvailable(FString& OutReason);
 	static bool IsPreferred();
 	static void ShutdownReusableStates();
+	static void PruneReusableStates();
 
 	bool Start(
 		const FString& OutputPath,
@@ -43,7 +44,15 @@ private:
 	static void DestroyStateResources(FState& InState);
 	static FCriticalSection& GetReusableStateCriticalSection();
 	static TArray<TUniquePtr<FState>>& GetReusableStates();
-	static TUniquePtr<FState> AcquireReusableState(int32 Width, int32 Height, int32 FPS, int32 BitrateKbps, int32 OutputSlotCount);
+	static TUniquePtr<FState> AcquireReusableState(
+		int32 Width,
+		int32 Height,
+		int32 FPS,
+		int32 BitrateKbps,
+		int32 OutputSlotCount,
+		void* HardwareDeviceIdentity,
+		void* VideoContextIdentity,
+		void* D3D12DeviceIdentity);
 
 private:
 	FString OutputPath;

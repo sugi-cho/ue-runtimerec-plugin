@@ -7,6 +7,8 @@ class FRHICommandListImmediate;
 
 class FRuntimeRecGpuVideoEncoder : public TSharedFromThis<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe>
 {
+	class FState;
+
 public:
 	FRuntimeRecGpuVideoEncoder();
 	~FRuntimeRecGpuVideoEncoder();
@@ -15,6 +17,8 @@ public:
 	static bool IsPreferred();
 	static void ShutdownReusableStates();
 	static void PruneReusableStates();
+	static FCriticalSection& GetReusableStateCriticalSection();
+	static TArray<TUniquePtr<FState>>& GetReusableStates();
 
 	bool Start(
 		const FString& OutputPath,
@@ -34,8 +38,6 @@ public:
 	bool IsStarted() const { return bStarted; }
 
 private:
-	class FState;
-
 	bool InitializeWriter(FString& OutError);
 	bool FinalizeWriter(FString& OutError);
 	bool SendEndOfStream(FString& OutError);
@@ -44,8 +46,6 @@ private:
 	bool DrainPackets(FString& OutError, bool bWaitForAll = false);
 	bool RetireStateForReuse();
 	static void DestroyStateResources(FState& InState);
-	static FCriticalSection& GetReusableStateCriticalSection();
-	static TArray<TUniquePtr<FState>>& GetReusableStates();
 	static TUniquePtr<FState> AcquireReusableState(
 		int32 Width,
 		int32 Height,

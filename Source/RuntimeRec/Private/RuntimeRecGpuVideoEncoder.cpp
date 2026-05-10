@@ -49,14 +49,76 @@ namespace
 		30.0f,
 		TEXT("How long idle reusable NVENC sessions may stay in the pool before being pruned. Set to 0 or below to disable reuse retention."));
 
+#if WITH_EDITOR
+	TAutoConsoleVariable<float> CVarRuntimeRecGpuVideoEncoderReusableIdleSecondsEditor(
+		TEXT("RuntimeRec.RenderTarget.GpuVideoEncoderReusableIdleSecondsEditor"),
+		600.0f,
+		TEXT("Editor-only TTL for idle reusable NVENC sessions before ticker pruning. Set to 0 or below to disable age-based editor pruning."));
+#endif
+
 	TAutoConsoleVariable<int32> CVarRuntimeRecMaxReusableGpuVideoEncoders(
 		TEXT("RuntimeRec.RenderTarget.MaxReusableGpuVideoEncoders"),
 		8,
 		TEXT("Maximum number of idle reusable NVENC sessions to keep in the pool. Oldest idle sessions are pruned first."));
 
+	TAutoConsoleVariable<float> CVarRuntimeRecGpuVideoEncoderOpenCooldownSeconds(
+		TEXT("RuntimeRec.RenderTarget.GpuVideoEncoderOpenCooldownSeconds"),
+		1.5f,
+		TEXT("Minimum cooldown after destroying reusable NVENC sessions before attempting a fresh open."));
+
 	FCriticalSection GpuEncoderSlotCriticalSection;
 	int32 ActiveGpuEncoderSlots = 0;
+	FCriticalSection ReusablePoolStatsCriticalSection;
+	double LastNvencDestroyTimeSeconds = -1.0;
+	double LastNvencPruneTimeSeconds = -1.0;
+	int32 LastNvencDestroyCount = 0;
+	int32 LastNvencPruneCount = 0;
 	constexpr int32 RuntimeRecGpuEncoderInputBufferCount = 3;
+
+	float GetReusableIdleSecondsCVar()
+	{
+#if WITH_EDITOR
+		return CVarRuntimeRecGpuVideoEncoderReusableIdleSecondsEditor.GetValueOnAnyThread();
+#else
+		return CVarRuntimeRecGpuVideoEncoderReusableIdleSeconds.GetValueOnAnyThread();
+#endif
+	}
+
+	void RecordNvencDestroyEvent(int32 DestroyCount)
+	{
+		FScopeLock Lock(&ReusablePoolStatsCriticalSection);
+		LastNvencDestroyTimeSeconds = FPlatformTime::Seconds();
+		LastNvencDestroyCount = DestroyCount;
+	}
+
+	void RecordNvencPruneEvent(int32 PrunedCount)
+	{
+		FScopeLock Lock(&ReusablePoolStatsCriticalSection);
+		LastNvencPruneTimeSeconds = FPlatformTime::Seconds();
+		LastNvencPruneCount = PrunedCount;
+	}
+
+	double GetLastNvencDestroyAgeSeconds()
+	{
+		FScopeLock Lock(&ReusablePoolStatsCriticalSection);
+		if (LastNvencDestroyTimeSeconds < 0.0)
+		{
+			return -1.0;
+		}
+		return FPlatformTime::Seconds() - LastNvencDestroyTimeSeconds;
+	}
+
+	int32 GetLastNvencPruneCount()
+	{
+		FScopeLock Lock(&ReusablePoolStatsCriticalSection);
+		return LastNvencPruneCount;
+	}
+
+	int32 GetLastNvencDestroyCount()
+	{
+		FScopeLock Lock(&ReusablePoolStatsCriticalSection);
+		return LastNvencDestroyCount;
+	}
 
 	bool TryReserveGpuEncoderSlot(FString& OutReason)
 	{
@@ -320,6 +382,12 @@ TArray<TUniquePtr<FRuntimeRecGpuVideoEncoder::FState>>& FRuntimeRecGpuVideoEncod
 	return ReusableStates;
 }
 
+int32 GetReusablePoolCount()
+{
+	FScopeLock Lock(&FRuntimeRecGpuVideoEncoder::GetReusableStateCriticalSection());
+	return FRuntimeRecGpuVideoEncoder::GetReusableStates().Num();
+}
+
 TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::AcquireReusableState(
 	int32 InWidth,
 	int32 InHeight,
@@ -332,8 +400,6 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 	int32 DeviceRemovedReason)
 {
 #if PLATFORM_WINDOWS
-	PruneReusableStates();
-
 	TUniquePtr<FState> ReusedState;
 	TArray<TUniquePtr<FState>> StaleStatesToDestroy;
 
@@ -364,6 +430,35 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 
 			if (bStateIsBroken || !bIdentityMatches)
 			{
+				int32 RegisteredInputCount = 0;
+				for (const FState::FInputSlot& InputSlot : Candidate->InputSlots)
+				{
+					if (InputSlot.RegisteredResource)
+					{
+						++RegisteredInputCount;
+					}
+				}
+
+				int32 RegisteredOutputCount = 0;
+				for (const FState::FOutputSlot& OutputSlot : Candidate->OutputSlots)
+				{
+					if (OutputSlot.RegisteredResource)
+					{
+						++RegisteredOutputCount;
+					}
+				}
+
+				const TCHAR* Reason = bStateIsBroken ? TEXT("Broken") : TEXT("DeviceMismatch");
+				UE_LOG(
+					LogTemp,
+					Display,
+					TEXT("RuntimeRec GPU encoder reusable state rejected [Reason=%s] Encoder=%p Device=%p DeviceRemovedReason=%s RegisteredInputs=%d RegisteredOutputs=%d"),
+					Reason,
+					Candidate->Encoder,
+					Candidate->D3D12Device.GetReference(),
+					*HResultToString(static_cast<HRESULT>(Candidate->DeviceRemovedReason)),
+					RegisteredInputCount,
+					RegisteredOutputCount);
 				StaleStatesToDestroy.Add(MoveTemp(ReusableStates[StateIndex]));
 				ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
 				continue;
@@ -392,6 +487,11 @@ TUniquePtr<FRuntimeRecGpuVideoEncoder::FState> FRuntimeRecGpuVideoEncoder::Acqui
 			DestroyStateResources(*StaleState);
 			ReleaseGpuEncoderSlot();
 		}
+	}
+
+	if (StaleStatesToDestroy.Num() > 0)
+	{
+		RecordNvencDestroyEvent(StaleStatesToDestroy.Num());
 	}
 
 	return ReusedState;
@@ -520,6 +620,9 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	bStopping = false;
 
 	const int32 OutputSlotCount = FMath::Max(1, CVarRuntimeRecGpuVideoEncoderPendingPacketCount.GetValueOnAnyThread());
+	const int32 ReusablePoolCountBeforeStart = GetReusablePoolCount();
+	const float OpenCooldownSeconds = FMath::Max(0.0f, CVarRuntimeRecGpuVideoEncoderOpenCooldownSeconds.GetValueOnAnyThread());
+	const double LastNvencDestroyAgeSeconds = GetLastNvencDestroyAgeSeconds();
 
 #if PLATFORM_WINDOWS
 	auto HardwareDevice = FAVDevice::GetHardwareDevice();
@@ -579,10 +682,38 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 	}
 #endif
 
+	const int32 ReusablePoolCountAfterAcquire = GetReusablePoolCount();
+	if (ReusablePoolCountAfterAcquire == 0 &&
+		LastNvencDestroyAgeSeconds >= 0.0 &&
+		LastNvencDestroyAgeSeconds < static_cast<double>(OpenCooldownSeconds))
+	{
+		const double RemainingSeconds = static_cast<double>(OpenCooldownSeconds) - LastNvencDestroyAgeSeconds;
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("RuntimeRec GPU encoder start cooldown active [Output=%s] RemainingSeconds=%.3f LastNvencDestroyAgeSeconds=%.3f"),
+			*InOutputPath,
+			RemainingSeconds,
+			LastNvencDestroyAgeSeconds);
+		FPlatformProcess::Sleep(static_cast<float>(RemainingSeconds));
+	}
+
 	if (!TryReserveGpuEncoderSlot(UnavailableReason))
 	{
 		OutError = UnavailableReason;
-		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder start rejected: slot reservation failed [Output=%s] %s"), *InOutputPath, *UnavailableReason);
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("RuntimeRec GPU encoder start rejected: slot reservation failed [Output=%s] %s ReusablePoolCountBeforeStart=%d ActiveGpuEncoderSlots=%d MaxGpuEncoderSlots=%d MaxReusableGpuVideoEncoders=%d ReusableIdleSeconds=%.3f LastNvencDestroyAgeSeconds=%.3f LastPrunedCount=%d"),
+			*InOutputPath,
+			*UnavailableReason,
+			ReusablePoolCountBeforeStart,
+			ActiveGpuEncoderSlots,
+			FMath::Max(0, CVarRuntimeRecMaxGpuVideoEncoders.GetValueOnAnyThread()),
+			FMath::Max(0, CVarRuntimeRecMaxReusableGpuVideoEncoders.GetValueOnAnyThread()),
+			GetReusableIdleSecondsCVar(),
+			LastNvencDestroyAgeSeconds,
+			GetLastNvencPruneCount());
 		return false;
 	}
 	bReservedGpuEncoderSlot = true;
@@ -659,14 +790,28 @@ bool FRuntimeRecGpuVideoEncoder::Start(
 		if (AttemptIndex < MaxOpenAttempts)
 		{
 			UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder will retry session open after a short delay [Output=%s]."), *OutputPath);
-			FPlatformProcess::Sleep(0.05f);
+			FPlatformProcess::Sleep(1.0f);
 		}
 	}
 
 	if (!bOpenedSession)
 	{
 		OutError = OpenSessionError;
-		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec GPU encoder open session failed [Output=%s]: %s"), *OutputPath, *OutError);
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("RuntimeRec GPU encoder open session failed [Output=%s]: %s ReusablePoolCountBeforeStart=%d LastNvencDestroyAgeSeconds=%.3f LastNvencDestroyCount=%d LastPrunedCount=%d ActiveGpuEncoderSlots=%d MaxGpuEncoderSlots=%d MaxReusableGpuVideoEncoders=%d ReusableIdleSeconds=%.3f OpenCooldownSeconds=%.3f"),
+			*OutputPath,
+			*OutError,
+			ReusablePoolCountBeforeStart,
+			LastNvencDestroyAgeSeconds,
+			GetLastNvencDestroyCount(),
+			GetLastNvencPruneCount(),
+			ActiveGpuEncoderSlots,
+			FMath::Max(0, CVarRuntimeRecMaxGpuVideoEncoders.GetValueOnAnyThread()),
+			FMath::Max(0, CVarRuntimeRecMaxReusableGpuVideoEncoders.GetValueOnAnyThread()),
+			GetReusableIdleSecondsCVar(),
+			OpenCooldownSeconds);
 		DestroyActiveState(OutError);
 		State.Reset();
 		if (bReservedGpuEncoderSlot)
@@ -1448,10 +1593,17 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 {
 #if PLATFORM_WINDOWS
 	TArray<TUniquePtr<FState>> StatesToDestroy;
-	const float ReusableIdleSeconds = CVarRuntimeRecGpuVideoEncoderReusableIdleSeconds.GetValueOnAnyThread();
+	TArray<FString> DropLogs;
+	const float ReusableIdleSeconds = GetReusableIdleSecondsCVar();
 	const int32 MaxReusableGpuEncoders = FMath::Max(0, CVarRuntimeRecMaxReusableGpuVideoEncoders.GetValueOnAnyThread());
 	const bool bDisableReuseRetention = ReusableIdleSeconds <= 0.0f || MaxReusableGpuEncoders <= 0;
 	const double NowSeconds = FPlatformTime::Seconds();
+	auto CurrentHardwareDevice = FAVDevice::GetHardwareDevice();
+	const auto CurrentVideoContext = CurrentHardwareDevice->GetContext<FVideoContextD3D12>();
+	const void* CurrentHardwareDeviceIdentity = &CurrentHardwareDevice.Get();
+	const void* CurrentVideoContextIdentity = CurrentVideoContext.Get();
+	const void* CurrentD3D12DeviceIdentity = CurrentVideoContext.IsValid() && CurrentVideoContext->Device ? CurrentVideoContext->Device.GetReference() : nullptr;
+	const int32 CurrentDeviceRemovedReason = static_cast<int32>(CurrentVideoContext.IsValid() && CurrentVideoContext->Device ? CurrentVideoContext->Device->GetDeviceRemovedReason() : S_OK);
 
 	{
 		FScopeLock Lock(&GetReusableStateCriticalSection());
@@ -1464,16 +1616,120 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 
 		if (bDisableReuseRetention)
 		{
-			StatesToDestroy = MoveTemp(ReusableStates);
+			for (int32 StateIndex = ReusableStates.Num() - 1; StateIndex >= 0; --StateIndex)
+			{
+				TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
+				if (!Candidate.IsValid())
+				{
+					void* EncoderPtr = static_cast<void*>(nullptr);
+					void* DevicePtr = static_cast<void*>(nullptr);
+					DropLogs.Add(FString::Printf(
+						TEXT("RuntimeRec GPU encoder reusable pool prune state [Reason=Shutdown] IdleAgeSeconds=%.3f IdleTTLSeconds=%.3f Encoder=%p Device=%p RegisteredInputs=%d RegisteredOutputs=%d"),
+						-1.0,
+						static_cast<double>(ReusableIdleSeconds),
+						EncoderPtr,
+						DevicePtr,
+						0,
+						0));
+				}
+				else
+				{
+					int32 RegisteredInputCount = 0;
+					for (const FState::FInputSlot& InputSlot : Candidate->InputSlots)
+					{
+						if (InputSlot.RegisteredResource)
+						{
+							++RegisteredInputCount;
+						}
+					}
+
+					int32 RegisteredOutputCount = 0;
+					for (const FState::FOutputSlot& OutputSlot : Candidate->OutputSlots)
+					{
+						if (OutputSlot.RegisteredResource)
+						{
+							++RegisteredOutputCount;
+						}
+					}
+
+					DropLogs.Add(FString::Printf(
+						TEXT("RuntimeRec GPU encoder reusable pool prune state [Reason=Shutdown] IdleAgeSeconds=%.3f IdleTTLSeconds=%.3f Encoder=%p Device=%p RegisteredInputs=%d RegisteredOutputs=%d"),
+						NowSeconds - Candidate->IdleSinceSeconds,
+						static_cast<double>(ReusableIdleSeconds),
+						Candidate->Encoder,
+						Candidate->D3D12Device.GetReference(),
+						RegisteredInputCount,
+						RegisteredOutputCount));
+				}
+
+				StatesToDestroy.Add(MoveTemp(ReusableStates[StateIndex]));
+				ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
+			}
 		}
 		else
 		{
 			for (int32 StateIndex = ReusableStates.Num() - 1; StateIndex >= 0; --StateIndex)
 			{
 				const TUniquePtr<FState>& Candidate = ReusableStates[StateIndex];
-				const bool bExpired = !Candidate.IsValid() || (NowSeconds - Candidate->IdleSinceSeconds) >= static_cast<double>(ReusableIdleSeconds);
-				if (bExpired)
+				const bool bExpired =
+#if WITH_EDITOR
+					false;
+#else
+					!Candidate.IsValid() || (NowSeconds - Candidate->IdleSinceSeconds) >= static_cast<double>(ReusableIdleSeconds);
+#endif
+				const bool bDeviceMismatch =
+					Candidate.IsValid() &&
+					(Candidate->HardwareDeviceIdentity != CurrentHardwareDeviceIdentity ||
+					Candidate->VideoContextIdentity != CurrentVideoContextIdentity ||
+					Candidate->D3D12DeviceIdentity != CurrentD3D12DeviceIdentity ||
+					Candidate->DeviceRemovedReason != CurrentDeviceRemovedReason);
+				const bool bBroken =
+					Candidate.IsValid() &&
+					(!Candidate->Encoder || Candidate->SinkWriter || Candidate->bMfStarted || Candidate->PendingPackets.Num() > 0);
+
+				FString Reason;
+				if (!Candidate.IsValid() || bBroken)
 				{
+					Reason = TEXT("Broken");
+				}
+				else if (bDeviceMismatch)
+				{
+					Reason = TEXT("DeviceMismatch");
+				}
+				else if (bExpired)
+				{
+					Reason = TEXT("Expired");
+				}
+
+				if (!Reason.IsEmpty())
+				{
+					int32 RegisteredInputCount = 0;
+					for (const FState::FInputSlot& InputSlot : Candidate->InputSlots)
+					{
+						if (InputSlot.RegisteredResource)
+						{
+							++RegisteredInputCount;
+						}
+					}
+
+					int32 RegisteredOutputCount = 0;
+					for (const FState::FOutputSlot& OutputSlot : Candidate->OutputSlots)
+					{
+						if (OutputSlot.RegisteredResource)
+						{
+							++RegisteredOutputCount;
+						}
+					}
+
+					DropLogs.Add(FString::Printf(
+						TEXT("RuntimeRec GPU encoder reusable pool prune state [Reason=%s] IdleAgeSeconds=%.3f IdleTTLSeconds=%.3f Encoder=%p Device=%p RegisteredInputs=%d RegisteredOutputs=%d"),
+						*Reason,
+						Candidate.IsValid() ? (NowSeconds - Candidate->IdleSinceSeconds) : -1.0,
+						static_cast<double>(ReusableIdleSeconds),
+						static_cast<void*>(Candidate.IsValid() ? Candidate->Encoder : nullptr),
+						static_cast<void*>(Candidate.IsValid() ? Candidate->D3D12Device.GetReference() : nullptr),
+						RegisteredInputCount,
+						RegisteredOutputCount));
 					StatesToDestroy.Add(MoveTemp(ReusableStates[StateIndex]));
 					ReusableStates.RemoveAtSwap(StateIndex, 1, EAllowShrinking::No);
 				}
@@ -1504,6 +1760,37 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 					break;
 				}
 
+				const TUniquePtr<FState>& Candidate = ReusableStates[OldestIndex];
+				int32 RegisteredInputCount = 0;
+				int32 RegisteredOutputCount = 0;
+				if (Candidate.IsValid())
+				{
+					for (const FState::FInputSlot& InputSlot : Candidate->InputSlots)
+					{
+						if (InputSlot.RegisteredResource)
+						{
+							++RegisteredInputCount;
+						}
+					}
+
+					for (const FState::FOutputSlot& OutputSlot : Candidate->OutputSlots)
+					{
+						if (OutputSlot.RegisteredResource)
+						{
+							++RegisteredOutputCount;
+						}
+					}
+				}
+
+				DropLogs.Add(FString::Printf(
+					TEXT("RuntimeRec GPU encoder reusable pool prune state [Reason=OverLimit] IdleAgeSeconds=%.3f IdleTTLSeconds=%.3f Encoder=%p Device=%p RegisteredInputs=%d RegisteredOutputs=%d"),
+					Candidate.IsValid() ? (NowSeconds - Candidate->IdleSinceSeconds) : -1.0,
+					static_cast<double>(ReusableIdleSeconds),
+					static_cast<void*>(Candidate.IsValid() ? Candidate->Encoder : nullptr),
+					static_cast<void*>(Candidate.IsValid() ? Candidate->D3D12Device.GetReference() : nullptr),
+					RegisteredInputCount,
+					RegisteredOutputCount));
+
 				StatesToDestroy.Add(MoveTemp(ReusableStates[OldestIndex]));
 				ReusableStates.RemoveAtSwap(OldestIndex, 1, EAllowShrinking::No);
 			}
@@ -1514,6 +1801,10 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 	{
 		const int32 PrunedCount = StatesToDestroy.Num();
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool prune begin [Count=%d]."), PrunedCount);
+		for (const FString& DropLog : DropLogs)
+		{
+			UE_LOG(LogTemp, Display, TEXT("%s"), *DropLog);
+		}
 		for (TUniquePtr<FState>& ReusableState : StatesToDestroy)
 		{
 			if (ReusableState.IsValid())
@@ -1522,6 +1813,8 @@ void FRuntimeRecGpuVideoEncoder::PruneReusableStates()
 			}
 			ReleaseGpuEncoderSlot();
 		}
+		RecordNvencPruneEvent(PrunedCount);
+		RecordNvencDestroyEvent(PrunedCount);
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool prune end."));
 	}
 #endif
@@ -1548,6 +1841,7 @@ void FRuntimeRecGpuVideoEncoder::ShutdownReusableStates()
 			}
 			ReleaseGpuEncoderSlot();
 		}
+		RecordNvencDestroyEvent(ShutdownCount);
 		UE_LOG(LogTemp, Display, TEXT("RuntimeRec GPU encoder reusable pool shutdown end."));
 	}
 #endif
@@ -1637,6 +1931,7 @@ void FRuntimeRecGpuVideoEncoder::DestroyActiveState(FString& OutError)
 	}
 
 	DestroyStateResources(*State);
+	RecordNvencDestroyEvent(1);
 #else
 	(void)OutError;
 #endif

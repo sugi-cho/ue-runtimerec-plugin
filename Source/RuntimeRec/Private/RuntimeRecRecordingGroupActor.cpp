@@ -47,15 +47,7 @@ bool ARuntimeRecRecordingGroupActor::StartRecording(FString& OutError)
 		return false;
 	}
 
-	URuntimeRecSubsystem* Subsystem = nullptr;
-	if (UWorld* World = GetWorld())
-	{
-		if (UGameInstance* GameInstance = World->GetGameInstance())
-		{
-			Subsystem = GameInstance->GetSubsystem<URuntimeRecSubsystem>();
-		}
-	}
-
+	URuntimeRecSubsystem* Subsystem = ResolveRuntimeRecSubsystem();
 	if (!Subsystem)
 	{
 		OutError = TEXT("RuntimeRec subsystem is not available.");
@@ -81,8 +73,8 @@ bool ARuntimeRecRecordingGroupActor::StartRecording(FString& OutError)
 		FRuntimeRecGroupRecordingHandle Handle;
 		Handle.RenderTarget = RenderTarget;
 
-		const FString FileName = FString::Printf(TEXT("%s_%s"), *RecordingStem, *BuildTargetSuffix(Index));
-		if (!StartRecordingForRenderTarget(RenderTarget, FileName, Handle.SessionId, Handle.OutputPath, LocalError))
+			const FString FileName = FString::Printf(TEXT("%s_%s"), *RecordingStem, *BuildTargetSuffix(Index));
+		if (!StartRecordingForRenderTarget(RenderTarget, FileName, Subsystem, Handle.SessionId, Handle.OutputPath, LocalError))
 		{
 			OutError = FString::Printf(TEXT("Failed to start render target recording %d: %s"), Index, *LocalError);
 			goto Fail;
@@ -122,7 +114,7 @@ bool ARuntimeRecRecordingGroupActor::StartRecording(FString& OutError)
 		Handle.CameraCaptureActor = CameraCaptureActor;
 
 		const FString FileName = FString::Printf(TEXT("%s_%s"), *RecordingStem, *BuildCameraSuffix(CameraCaptureActor, Index));
-		if (!StartRecordingForRenderTarget(RenderTarget, FileName, Handle.SessionId, Handle.OutputPath, LocalError))
+		if (!StartRecordingForRenderTarget(RenderTarget, FileName, Subsystem, Handle.SessionId, Handle.OutputPath, LocalError))
 		{
 			OutError = FString::Printf(TEXT("Failed to start camera capture recording %d: %s"), Index, *LocalError);
 			goto Fail;
@@ -254,19 +246,11 @@ TArray<FString> ARuntimeRecRecordingGroupActor::GetCurrentOutputPaths() const
 bool ARuntimeRecRecordingGroupActor::StartRecordingForRenderTarget(
 	UTextureRenderTarget2D* RenderTarget,
 	const FString& FileName,
+	URuntimeRecSubsystem* Subsystem,
 	FString& OutSessionId,
 	FString& OutOutputPath,
 	FString& OutError)
 {
-	URuntimeRecSubsystem* Subsystem = nullptr;
-	if (UWorld* World = GetWorld())
-	{
-		if (UGameInstance* GameInstance = World->GetGameInstance())
-		{
-			Subsystem = GameInstance->GetSubsystem<URuntimeRecSubsystem>();
-		}
-	}
-
 	if (!Subsystem)
 	{
 		OutError = TEXT("RuntimeRec subsystem is not available.");
@@ -317,4 +301,21 @@ FString ARuntimeRecRecordingGroupActor::BuildCameraSuffix(const ARuntimeRecCamer
 	}
 
 	return FString::Printf(TEXT("Cam%02d"), Index + 1);
+}
+
+URuntimeRecSubsystem* ARuntimeRecRecordingGroupActor::ResolveRuntimeRecSubsystem() const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return nullptr;
+	}
+
+	UGameInstance* GameInstance = World->GetGameInstance();
+	if (!GameInstance)
+	{
+		return nullptr;
+	}
+
+	return GameInstance->GetSubsystem<URuntimeRecSubsystem>();
 }

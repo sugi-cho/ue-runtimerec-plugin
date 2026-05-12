@@ -397,6 +397,23 @@ bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
 		RenderTarget->SizeX == LocalOptions.Width &&
 		RenderTarget->SizeY == LocalOptions.Height;
 
+	if (!bRenderTargetCanUseGpuEncoder)
+	{
+		FString FormatMismatch = RenderTarget->GetFormat() != PF_B8G8R8A8 ?
+			FString::Printf(TEXT("format mismatch (got %d, expected %d)"), (int32)RenderTarget->GetFormat(), (int32)PF_B8G8R8A8) : TEXT("");
+		FString SampleMismatch = RenderTarget->GetSampleCount() != ETextureRenderTargetSampleCount::RTSC_1 ?
+			FString::Printf(TEXT("MSAA sample count mismatch (got %d, expected 1)"), (int32)RenderTarget->GetSampleCount()) : TEXT("");
+		FString SizeMismatch = (RenderTarget->SizeX != LocalOptions.Width || RenderTarget->SizeY != LocalOptions.Height) ?
+			FString::Printf(TEXT("size mismatch (RT: %dx%d, expected: %dx%d)"), RenderTarget->SizeX, RenderTarget->SizeY, LocalOptions.Width, LocalOptions.Height) : TEXT("");
+
+		FString Reason;
+		if (!FormatMismatch.IsEmpty()) Reason += FormatMismatch + TEXT(" ");
+		if (!SampleMismatch.IsEmpty()) Reason += SampleMismatch + TEXT(" ");
+		if (!SizeMismatch.IsEmpty()) Reason += SizeMismatch + TEXT(" ");
+
+		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: RenderTarget cannot use GPU encoder (%s); will use CPU encoder."), *Reason.TrimEnd());
+	}
+
 	if (bRenderTargetCanUseGpuEncoder && FRuntimeRecGpuVideoEncoder::IsPreferred())
 	{
 		Session.GpuEncoder = MakeShared<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe>();
@@ -416,6 +433,10 @@ bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
 		{
 			UE_LOG(LogTemp, Display, TEXT("RuntimeRec: Using GPU video encoder for RenderTarget recording."));
 		}
+	}
+	else if (bRenderTargetCanUseGpuEncoder && !FRuntimeRecGpuVideoEncoder::IsPreferred())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RuntimeRec: GPU encoder is disabled by RuntimeRec.RenderTarget.GpuVideoEncoder cvar; will use CPU encoder."));
 	}
 
 	if (!Session.GpuEncoder.IsValid())

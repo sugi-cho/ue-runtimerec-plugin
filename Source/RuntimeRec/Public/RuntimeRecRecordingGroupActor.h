@@ -83,9 +83,12 @@ public:
 	bool bAutoStartRecording = false;
 
 private:
+	URuntimeRecSubsystem* ResolveRuntimeRecSubsystem() const;
+
 	bool StartRecordingForRenderTarget(
 		UTextureRenderTarget2D* RenderTarget,
 		const FString& FileName,
+		URuntimeRecSubsystem* Subsystem,
 		FString& OutSessionId,
 		FString& OutOutputPath,
 		FString& OutError);

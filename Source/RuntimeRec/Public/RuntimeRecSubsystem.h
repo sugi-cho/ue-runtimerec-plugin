@@ -124,6 +124,7 @@ private:
 		int64 NextCaptureFrameIndex = 0;
 		FRuntimeRecVideoEncoder* Encoder = nullptr;
 		TSharedPtr<FRuntimeRecGpuVideoEncoder, ESPMode::ThreadSafe> GpuEncoder;
+		bool bGpuColorSpaceConversion = false;
 		TArray<TSharedPtr<FRuntimeRecReadbackRequest, ESPMode::ThreadSafe>> PendingReadbacks;
 		TArray<TSharedPtr<FRuntimeRecGpuEncodeRequest, ESPMode::ThreadSafe>> PendingGpuEncodes;
 	};

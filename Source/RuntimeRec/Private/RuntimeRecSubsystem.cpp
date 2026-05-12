@@ -10,7 +10,14 @@
 #include "Misc/Paths.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
+#include "RHIResources.h"
+#include "RHIStaticStates.h"
 #include "RHIGPUReadback.h"
+#include "RendererInterface.h"
+#include "Modules/ModuleManager.h"
+#include "ScreenRendering.h"
+#include "CommonRenderResources.h"
+#include "PipelineStateCache.h"
 #include "RuntimeRecGpuVideoEncoder.h"
 #include "RuntimeRecVideoEncoder.h"
 #include "TextureResource.h"
@@ -46,6 +53,90 @@ namespace
 				Width * sizeof(FColor));
 		}
 	}
+}
+
+bool ConvertRenderTargetTextureToSrgb(
+	FRHICommandListImmediate& RHICmdList,
+	FTextureRHIRef SourceTexture,
+	FTextureRHIRef& OutConvertedTexture,
+	FString& OutError)
+{
+	const FRHITextureDesc& SourceDesc = SourceTexture->GetDesc();
+	const int32 Width = SourceDesc.Extent.X;
+	const int32 Height = SourceDesc.Extent.Y;
+	if (Width <= 0 || Height <= 0)
+	{
+		OutError = TEXT("Invalid source texture size for GPU conversion.");
+		return false;
+	}
+
+	const FRHITextureCreateDesc ConvertedDesc = FRHITextureCreateDesc::Create2D(
+		TEXT("RuntimeRecRenderTargetConvertToSRGB"),
+		Width,
+		Height,
+		PF_B8G8R8A8)
+		.SetFlags(ETextureCreateFlags::RenderTargetable | ETextureCreateFlags::ShaderResource | ETextureCreateFlags::SRGB)
+		.SetClearValue(FClearValueBinding::None);
+
+	if (!OutConvertedTexture.IsValid() ||
+		OutConvertedTexture->GetDesc().Extent.X != Width ||
+		OutConvertedTexture->GetDesc().Extent.Y != Height)
+	{
+		OutConvertedTexture = RHICreateTexture(ConvertedDesc);
+		if (!OutConvertedTexture.IsValid())
+		{
+			OutError = TEXT("Failed to allocate GPU color conversion texture.");
+			return false;
+		}
+	}
+
+	RHICmdList.Transition(FRHITransitionInfo(SourceTexture, ERHIAccess::Unknown, ERHIAccess::SRVMask));
+
+	FRHIRenderPassInfo RPInfo(OutConvertedTexture, ERenderTargetActions::Load_Store);
+	RHICmdList.BeginRenderPass(RPInfo, TEXT("RuntimeRecGpuEncoderConvertToSRGB"));
+	{
+		RHICmdList.SetViewport(0, 0, 0.0f, Width, Height, 1.0f);
+
+		FGraphicsPipelineStateInitializer GraphicsPSOInit;
+		RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+		GraphicsPSOInit.BlendState = TStaticBlendState<>::GetRHI();
+		GraphicsPSOInit.RasterizerState = TStaticRasterizerState<>::GetRHI();
+		GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+
+		const ERHIFeatureLevel::Type FeatureLevel = GMaxRHIFeatureLevel;
+		FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(FeatureLevel);
+		TShaderMapRef<FScreenVS> VertexShader(ShaderMap);
+		TShaderMapRef<FScreenPS> PixelShader(ShaderMap);
+
+		GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GFilterVertexDeclaration.VertexDeclarationRHI;
+		GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+		GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+		GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+
+		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+
+		FRHISamplerState* SamplerState = TStaticSamplerState<SF_Bilinear>::GetRHI();
+		SetShaderParametersLegacyPS(RHICmdList, PixelShader, SamplerState, SourceTexture);
+
+		IRendererModule* RendererModule = &FModuleManager::GetModuleChecked<IRendererModule>(TEXT("Renderer"));
+		RendererModule->DrawRectangle(
+			RHICmdList,
+			0,
+			0,
+			Width,
+			Height,
+			0.0f,
+			0.0f,
+			Width,
+			Height,
+			FIntPoint(Width, Height),
+			FIntPoint(Width, Height),
+			VertexShader,
+			EDRF_Default);
+	}
+	RHICmdList.EndRenderPass();
+
+	return true;
 }
 
 void URuntimeRecSubsystem::Deinitialize()
@@ -396,6 +487,8 @@ bool URuntimeRecSubsystem::StartRenderTargetRecordingInternal(
 		RenderTarget->GetSampleCount() == ETextureRenderTargetSampleCount::RTSC_1 &&
 		RenderTarget->SizeX == LocalOptions.Width &&
 		RenderTarget->SizeY == LocalOptions.Height;
+
+	Session.bGpuColorSpaceConversion = !RenderTarget->IsSRGB();
 
 	if (!bRenderTargetCanUseGpuEncoder)
 	{
@@ -760,6 +853,8 @@ bool URuntimeRecSubsystem::QueueRenderTargetGpuEncode(
 		return false;
 	}
 
+	const bool bRequiresColorSpaceConversion = Session.bGpuColorSpaceConversion;
+
 	if (Session.PendingGpuEncodes.Num() >= RuntimeRecMaxPendingGpuEncodes)
 	{
 		if (!Session.ActiveOptions.bAllowFrameDrop)
@@ -782,7 +877,7 @@ bool URuntimeRecSubsystem::QueueRenderTargetGpuEncode(
 	Session.PendingGpuEncodes.Add(Request);
 
 	ENQUEUE_RENDER_COMMAND(RuntimeRecQueueRenderTargetGpuEncode)(
-		[Request, GpuEncoder, Resource, FrameIndex](FRHICommandListImmediate& RHICmdList)
+		[Request, GpuEncoder, Resource, FrameIndex, bRequiresColorSpaceConversion](FRHICommandListImmediate& RHICmdList)
 		{
 			if (Request->bCancelled)
 			{
@@ -803,7 +898,20 @@ bool URuntimeRecSubsystem::QueueRenderTargetGpuEncode(
 			}
 
 			FString EncodeError;
-			if (!GpuEncoder->EncodeTexture_RenderThread(RHICmdList, SourceTexture, FrameIndex, EncodeError))
+			FTextureRHIRef TextureToEncode = SourceTexture;
+			FTextureRHIRef ConvertedTexture;
+			if (bRequiresColorSpaceConversion)
+			{
+				if (!ConvertRenderTargetTextureToSrgb(RHICmdList, SourceTexture, ConvertedTexture, EncodeError))
+				{
+					Request->Error = EncodeError;
+					Request->bHadError = true;
+					return;
+				}
+				TextureToEncode = ConvertedTexture;
+			}
+
+			if (!GpuEncoder->EncodeTexture_RenderThread(RHICmdList, TextureToEncode, FrameIndex, EncodeError))
 			{
 				Request->Error = EncodeError;
 				Request->bHadError = true;
@@ -888,6 +996,13 @@ bool URuntimeRecSubsystem::QueueRenderTargetReadback(
 	if (!Resource)
 	{
 		OutError = TEXT("RenderTarget resource is not available.");
+		return false;
+	}
+
+	if (!RenderTarget->IsSRGB())
+	{
+		OutError = TEXT("RenderTarget must be sRGB for async readback; falling back to ReadPixels.");
+		bOutCanUseReadPixelsFallback = true;
 		return false;
 	}
 

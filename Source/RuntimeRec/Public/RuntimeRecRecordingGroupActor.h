@@ -6,6 +6,7 @@
 
 class ARuntimeRecCameraCaptureActor;
 class UTextureRenderTarget2D;
+class URuntimeRecSubsystem;
 
 USTRUCT()
 struct FRuntimeRecGroupRecordingHandle

@@ -198,8 +198,8 @@ RuntimeRec_YYYYMMDD_HHMMSS.mp4
 
 ## 実装上の注意
 
-- RenderTarget 録画は D3D12 / `PF_B8G8R8A8` / 非MSAA の場合、Direct NVENC による GPU エンコードを優先します。これにより Raw FullHD フレームの GPU -> CPU 転送を避け、CPU 側へ戻るデータを圧縮済み H.264 packet に抑えます。
-- GPU エンコードが使えない場合、RenderTarget 録画は `FRHIGPUTextureReadback` による非同期 readback を使います。未対応形式などの場合は既存の `ReadPixels` 経路にフォールバックします。
+- RenderTarget 録画は D3D12 / `PF_B8G8R8A8` / 非MSAA / sRGB の場合、Direct NVENC による GPU エンコードを優先します。これにより Raw FullHD フレームの GPU -> CPU 転送を避け、CPU 側へ戻るデータを圧縮済み H.264 packet に抑えます。
+- GPU エンコードが使えない場合、RenderTarget 録画は `FRHIGPUTextureReadback` による非同期 readback を使います。未対応形式や非sRGBの RenderTarget などの場合は既存の `ReadPixels` 経路にフォールバックします。
 - GPU エンコードは `RuntimeRec.RenderTarget.GpuVideoEncoder 0` で無効化できます。
 - GPU エンコードの同時利用数は `RuntimeRec.RenderTarget.MaxGpuVideoEncoders` で制限できます。既定値は `8` で、上限を超えた RenderTarget 録画は async readback 経路へ自動フォールバックします。
 - Viewport 録画は現在も `ReadPixels` を使います。

@@ -26,7 +26,7 @@ ARuntimeRecCameraCaptureActor::ARuntimeRecCameraCaptureActor()
 	SceneCaptureComponent->bAlwaysPersistRenderingState = true;
 	SceneCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
 	SceneCaptureComponent->CompositeMode = ESceneCaptureCompositeMode::SCCM_Overwrite;
-	SceneCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	SceneCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
 }
 
 void ARuntimeRecCameraCaptureActor::OnConstruction(const FTransform& Transform)
@@ -229,8 +229,10 @@ UTextureRenderTarget2D* ARuntimeRecCameraCaptureActor::GetOrCreateRenderTarget()
 	{
 		GeneratedRenderTarget = NewObject<UTextureRenderTarget2D>(this, NAME_None, RF_Transient);
 		GeneratedRenderTarget->ClearColor = FLinearColor::Black;
-		GeneratedRenderTarget->TargetGamma = 2.2f;
-		GeneratedRenderTarget->InitCustomFormat(Width, Height, PF_B8G8R8A8, false);
+		GeneratedRenderTarget->bForceLinearGamma = true;
+		GeneratedRenderTarget->TargetGamma = 1.0f;
+		GeneratedRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		GeneratedRenderTarget->InitAutoFormat(Width, Height);
 		GeneratedRenderTarget->UpdateResourceImmediate(true);
 	}
 
@@ -330,7 +332,7 @@ void ARuntimeRecCameraCaptureActor::UpdateCaptureConfiguration(bool bAllowPendin
 	SceneCaptureComponent->bAlwaysPersistRenderingState = true;
 	SceneCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
 	SceneCaptureComponent->CompositeMode = ESceneCaptureCompositeMode::SCCM_Overwrite;
-	SceneCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	SceneCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
 	SceneCaptureComponent->ShowFlags.SetPostProcessing(bIncludeCameraPostProcess);
 	SceneCaptureComponent->ShowFlags.SetLumenGlobalIllumination(true);
 	SceneCaptureComponent->ShowFlags.SetLumenReflections(true);

@@ -2,6 +2,12 @@
 
 Unreal Engine の Runtime 実行中に、Viewport または `UTextureRenderTarget2D` の映像を MP4 として保存するための Runtime プラグインです。
 
+## Author
+
+- Author: Hironori Sugino
+- Website: https://sugi.cc
+- Original Repository: https://github.com/sugi-cho/ue-runtimerec-plugin
+
 ## 対応環境
 
 - Unreal Engine 5.7 以降
